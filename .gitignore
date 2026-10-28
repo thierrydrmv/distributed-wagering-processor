@@ -1,0 +1,40 @@
+# Dependências
+node_modules/
+
+# Build e cobertura
+dist/
+coverage/
+*.tsbuildinfo
+
+# Variáveis de ambiente e segredos
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.pem
+*.key
+
+# Logs
+logs/
+*.log
+
+# Dados locais de containers
+.docker-data/
+.localstack/
+pgdata/
+
+# Arquivos temporários
+tmp/
+temp/
+.cache/
+
+# Sistema operacional
+.DS_Store
+Thumbs.db
+
+# Configurações pessoais de editores
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.example.json
+challenge.md
