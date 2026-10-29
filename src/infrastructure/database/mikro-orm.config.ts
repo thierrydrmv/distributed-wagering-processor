@@ -4,6 +4,7 @@ import { Migrator } from '@mikro-orm/migrations';
 import { defineConfig } from '@mikro-orm/postgresql';
 import { WalletSchema } from './entities/wallet.record';
 import { WagerTransactionSchema } from './entities/wager-transaction.record';
+import { WalletLedgerEntrySchema } from './entities/wallet-ledger-entry.record';
 
 const clientUrl = process.env.DATABASE_URL;
 
@@ -13,7 +14,7 @@ if (!clientUrl) {
 
 export default defineConfig({
   clientUrl,
-  entities: [WalletSchema, WagerTransactionSchema],
+  entities: [WalletSchema, WagerTransactionSchema, WalletLedgerEntrySchema],
 
   extensions: [Migrator],
 

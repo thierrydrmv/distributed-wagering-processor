@@ -409,7 +409,7 @@
       "checks": [
         {
           "name": "wager_transactions_amount_valid",
-          "columnName": "kind",
+          "columnName": "amount",
           "definition": "CHECK ((((kind = 'LOSS'::text) AND (amount = (0)::numeric)) OR ((kind = 'WIN'::text) AND (amount >= (0)::numeric)) OR ((kind = ANY (ARRAY['OPENING'::text, 'BET'::text, 'REFUND'::text, 'ROLLBACK'::text])) AND (amount > (0)::numeric))))",
           "expression": "(kind = 'LOSS'::text) AND (amount = (0)) OR (kind = 'WIN'::text) AND (amount >= (0)) OR (kind = ANY (ARRAY['OPENING'::text, 'BET'::text, 'REFUND'::text, 'ROLLBACK'::text])) AND (amount > (0))"
         },
@@ -427,7 +427,7 @@
         },
         {
           "name": "wager_transactions_required_reference",
-          "columnName": "kind",
+          "columnName": "reference_external_transaction_id",
           "definition": "CHECK (((kind <> ALL (ARRAY['REFUND'::text, 'ROLLBACK'::text])) OR ((reference_external_transaction_id IS NOT NULL) AND (length(TRIM(BOTH FROM reference_external_transaction_id)) > 0))))",
           "expression": "(kind <> ALL (ARRAY['REFUND'::text, 'ROLLBACK'::text])) OR ((reference_external_transaction_id IS NOT NULL) AND (length(TRIM(BOTH FROM reference_external_transaction_id)) > 0))"
         },
@@ -458,6 +458,260 @@
           ],
           "constraintName": "wager_transactions_wallet_id_foreign",
           "localTableName": "public.wager_transactions",
+          "referencedTableName": "public.wallets",
+          "referencedColumnNames": [
+            "id"
+          ],
+          "updateRule": "restrict",
+          "deleteRule": "restrict"
+        }
+      },
+      "nativeEnums": {},
+      "comment": null
+    },
+    {
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": true,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "uuid"
+        },
+        "wallet_id": {
+          "name": "wallet_id",
+          "type": "uuid",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": true,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "uuid"
+        },
+        "transaction_id": {
+          "name": "transaction_id",
+          "type": "uuid",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "uuid"
+        },
+        "direction": {
+          "name": "direction",
+          "type": "text",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [
+            "DEBIT",
+            "CREDIT"
+          ],
+          "mappedType": "enum"
+        },
+        "amount": {
+          "name": "amount",
+          "type": "numeric(20,2)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": 20,
+          "scale": 2,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "decimal"
+        },
+        "currency": {
+          "name": "currency",
+          "type": "varchar(3)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": 3,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "string"
+        },
+        "balance_before": {
+          "name": "balance_before",
+          "type": "numeric(20,2)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": 20,
+          "scale": 2,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "decimal"
+        },
+        "balance_after": {
+          "name": "balance_after",
+          "type": "numeric(20,2)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": 20,
+          "scale": 2,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "decimal"
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamptz(6)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": 6,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "datetime"
+        }
+      },
+      "name": "wallet_ledger_entries",
+      "schema": "public",
+      "indexes": [
+        {
+          "columnNames": [
+            "transaction_id"
+          ],
+          "composite": false,
+          "constraint": false,
+          "keyName": "ledger_transaction_idx",
+          "unique": false,
+          "primary": false
+        },
+        {
+          "columnNames": [
+            "wallet_id",
+            "created_at",
+            "id"
+          ],
+          "composite": true,
+          "constraint": false,
+          "keyName": "ledger_wallet_created_id_idx",
+          "unique": false,
+          "primary": false
+        },
+        {
+          "columnNames": [
+            "wallet_id",
+            "transaction_id"
+          ],
+          "composite": true,
+          "constraint": true,
+          "keyName": "ledger_wallet_transaction_unique",
+          "unique": true,
+          "primary": false
+        },
+        {
+          "columnNames": [
+            "id"
+          ],
+          "composite": false,
+          "constraint": false,
+          "keyName": "wallet_ledger_entries_pkey",
+          "unique": true,
+          "primary": true
+        }
+      ],
+      "checks": [
+        {
+          "name": "ledger_amount_valid",
+          "columnName": "amount",
+          "definition": "CHECK (((amount > (0)::numeric) AND (amount <= 999999999999999999.99)))",
+          "expression": "amount > (0) AND (amount <= 999999999999999999.99)"
+        },
+        {
+          "name": "ledger_arithmetic_valid",
+          "columnName": "amount",
+          "definition": "CHECK ((((direction = 'CREDIT'::text) AND (balance_after = (balance_before + amount))) OR ((direction = 'DEBIT'::text) AND (balance_after = (balance_before - amount)))))",
+          "expression": "((direction = 'CREDIT'::text) AND (balance_after = (balance_before + amount))) OR ((direction = 'DEBIT'::text) AND (balance_after = (balance_before - amount)))"
+        },
+        {
+          "name": "ledger_balances_valid",
+          "columnName": "balance_before",
+          "definition": "CHECK (((balance_before >= (0)::numeric) AND (balance_before <= 999999999999999999.99) AND (balance_after >= (0)::numeric) AND (balance_after <= 999999999999999999.99)))",
+          "expression": "balance_before >= (0) AND balance_before <= 999999999999999999.99) AND (balance_after >= (0) AND (balance_after <= 999999999999999999.99)"
+        },
+        {
+          "name": "ledger_currency_supported",
+          "columnName": "currency",
+          "definition": "CHECK (((currency)::text ~ '^(BRL|USD|EUR|GBP)$'::text))",
+          "expression": "currency ~ '^(BRL|USD|EUR|GBP)$'::text"
+        }
+      ],
+      "foreignKeys": {
+        "wallet_ledger_entries_transaction_id_foreign": {
+          "columnNames": [
+            "transaction_id"
+          ],
+          "constraintName": "wallet_ledger_entries_transaction_id_foreign",
+          "localTableName": "public.wallet_ledger_entries",
+          "referencedTableName": "public.wager_transactions",
+          "referencedColumnNames": [
+            "id"
+          ],
+          "updateRule": "restrict",
+          "deleteRule": "restrict"
+        },
+        "wallet_ledger_entries_wallet_id_foreign": {
+          "columnNames": [
+            "wallet_id"
+          ],
+          "constraintName": "wallet_ledger_entries_wallet_id_foreign",
+          "localTableName": "public.wallet_ledger_entries",
           "referencedTableName": "public.wallets",
           "referencedColumnNames": [
             "id"
