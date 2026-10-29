@@ -38,3 +38,4 @@ Thumbs.db
 !.vscode/extensions.json
 !.vscode/settings.example.json
 challenge.md
+src/infrastructure/database/migrations/.snapshot-*_test.json
