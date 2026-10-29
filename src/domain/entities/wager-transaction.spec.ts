@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { Money } from '../value-objects/money';
+import { LedgerDirection } from './wallet-ledger-entry';
 import {
   FailureCode,
   InvalidTransactionStateError,
@@ -7,6 +8,7 @@ import {
   WagerTransaction,
   WagerTransactionKind,
   WagerTransactionStatus,
+  InvalidTransactionReferenceError,
 } from './wager-transaction';
 import type { CreateWagerTransactionProps } from './wager-transaction';
 
@@ -206,5 +208,211 @@ describe('WagerTransaction', () => {
     transaction.processedAt?.setTime(0);
 
     expect(transaction.processedAt?.getTime()).toBe(originalProcessingTime);
+  });
+});
+
+describe('WagerTransaction references and ledger direction', () => {
+  const processedReference = (
+    overrides: Partial<CreateWagerTransactionProps> = {},
+  ): WagerTransaction => {
+    const transaction = WagerTransaction.create(
+      props({
+        id: 'original-internal-id',
+        externalTransactionId: 'original-external-id',
+        idempotencyKey: 'provider-a:original-external-id',
+        ...overrides,
+      }),
+    );
+
+    transaction.markProcessed(
+      transaction.referenceExternalTransactionId !== undefined
+        ? 'earlier-internal-id'
+        : undefined,
+      new Date('2026-10-28T12:01:00.000Z'),
+    );
+
+    return transaction;
+  };
+
+  const reversal = (kind = WagerTransactionKind.Refund): WagerTransaction =>
+    WagerTransaction.create(
+      props({
+        kind,
+        referenceExternalTransactionId: 'original-external-id',
+      }),
+    );
+
+  const expectReferenceFailure = (
+    action: () => unknown,
+    code: FailureCode,
+  ): void => {
+    let captured: unknown;
+
+    try {
+      action();
+    } catch (error) {
+      captured = error;
+    }
+
+    expect(captured).toBeInstanceOf(InvalidTransactionReferenceError);
+
+    if (captured instanceof InvalidTransactionReferenceError) {
+      expect(captured.code).toBe(code);
+    }
+  };
+
+  test('BET debits and WIN credits', () => {
+    expect(WagerTransaction.create(props()).ledgerDirectionFor()).toBe(
+      LedgerDirection.Debit,
+    );
+
+    expect(
+      WagerTransaction.create(
+        props({ kind: WagerTransactionKind.Win }),
+      ).ledgerDirectionFor(),
+    ).toBe(LedgerDirection.Credit);
+  });
+
+  test('LOSS and zero-value WIN produce no ledger direction', () => {
+    for (const kind of [WagerTransactionKind.Loss, WagerTransactionKind.Win]) {
+      const transaction = WagerTransaction.create(
+        props({ kind, money: brl('0.00') }),
+      );
+
+      expect(transaction.ledgerDirectionFor()).toBeUndefined();
+    }
+  });
+
+  test('REFUND credits a processed BET', () => {
+    expect(reversal().ledgerDirectionFor(processedReference())).toBe(
+      LedgerDirection.Credit,
+    );
+  });
+
+  test('ROLLBACK of BET credits the wallet', () => {
+    expect(
+      reversal(WagerTransactionKind.Rollback).ledgerDirectionFor(
+        processedReference(),
+      ),
+    ).toBe(LedgerDirection.Credit);
+  });
+
+  test.each([WagerTransactionKind.Win, WagerTransactionKind.Refund])(
+    'ROLLBACK of %s debits the wallet',
+    (kind) => {
+      const reference = processedReference({
+        kind,
+        referenceExternalTransactionId:
+          kind === WagerTransactionKind.Refund ? 'earlier-bet' : undefined,
+      });
+
+      expect(
+        reversal(WagerTransactionKind.Rollback).ledgerDirectionFor(reference),
+      ).toBe(LedgerDirection.Debit);
+    },
+  );
+
+  test('missing reference has a specific failure code', () => {
+    expectReferenceFailure(
+      () => reversal().ledgerDirectionFor(),
+      FailureCode.ReferenceNotFound,
+    );
+  });
+
+  test('rejects a reference that is not processed', () => {
+    const reference = WagerTransaction.create(
+      props({
+        id: 'original-internal-id',
+        externalTransactionId: 'original-external-id',
+      }),
+    );
+
+    expectReferenceFailure(
+      () => reversal().ledgerDirectionFor(reference),
+      FailureCode.ReferenceNotProcessed,
+    );
+  });
+
+  test('rejects a partial reversal', () => {
+    const reference = processedReference({
+      money: brl('50.00'),
+    });
+
+    expectReferenceFailure(
+      () => reversal().ledgerDirectionFor(reference),
+      FailureCode.ReferenceAmountMismatch,
+    );
+  });
+
+  test('REFUND cannot reverse a WIN', () => {
+    const reference = processedReference({
+      kind: WagerTransactionKind.Win,
+    });
+
+    expectReferenceFailure(
+      () => reversal().ledgerDirectionFor(reference),
+      FailureCode.InvalidReferenceKind,
+    );
+  });
+
+  test('ROLLBACK cannot reverse another ROLLBACK', () => {
+    const reference = processedReference({
+      kind: WagerTransactionKind.Rollback,
+      referenceExternalTransactionId: 'earlier-bet',
+    });
+
+    expectReferenceFailure(
+      () =>
+        reversal(WagerTransactionKind.Rollback).ledgerDirectionFor(reference),
+      FailureCode.InvalidReferenceKind,
+    );
+  });
+
+  test('rejects references with mismatched identity or currency', () => {
+    const mismatches: Partial<CreateWagerTransactionProps>[] = [
+      { providerId: 'other-provider' },
+      { playerId: 'other-player' },
+      { walletId: 'other-wallet' },
+      { roundId: 'other-round' },
+      { externalTransactionId: 'other-external-id' },
+      {
+        money: Money.from({
+          amount: '25.00',
+          currency: 'GBP',
+        }),
+      },
+    ];
+
+    for (const mismatch of mismatches) {
+      const reference = processedReference(mismatch);
+
+      expectReferenceFailure(
+        () => reversal().ledgerDirectionFor(reference),
+        FailureCode.ReferenceMismatch,
+      );
+    }
+  });
+
+  test('WIN may reference a BET with a different amount', () => {
+    const win = WagerTransaction.create(
+      props({
+        kind: WagerTransactionKind.Win,
+        money: brl('150.00'),
+        referenceExternalTransactionId: 'original-external-id',
+      }),
+    );
+
+    expect(win.ledgerDirectionFor(processedReference())).toBe(
+      LedgerDirection.Credit,
+    );
+  });
+
+  test('reference validation does not change transaction state', () => {
+    const transaction = reversal();
+
+    transaction.validateReference(processedReference());
+
+    expect(transaction.status).toBe(WagerTransactionStatus.Pending);
+    expect(transaction.referenceTransactionId).toBeUndefined();
   });
 });

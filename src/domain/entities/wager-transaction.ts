@@ -1,4 +1,5 @@
 import { Money } from '../value-objects/money';
+import { LedgerDirection } from './wallet-ledger-entry';
 
 export enum WagerTransactionKind {
   Opening = 'OPENING',
@@ -66,6 +67,13 @@ export class InvalidTransactionStateError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'InvalidTransactionStateError';
+  }
+}
+
+export class InvalidTransactionReferenceError extends Error {
+  constructor(public readonly code: FailureCode) {
+    super(`Invalid transaction reference: ${code}`);
+    this.name = 'InvalidTransactionReferenceError';
   }
 }
 
@@ -292,6 +300,99 @@ export class WagerTransaction {
       this.kind === WagerTransactionKind.Refund ||
       this.kind === WagerTransactionKind.Rollback
     );
+  }
+
+  validateReference(reference: WagerTransaction): void {
+    if (this.referenceExternalTransactionId === undefined) {
+      throw new InvalidTransactionReferenceError(FailureCode.ReferenceMismatch);
+    }
+
+    if (
+      reference.id === this.id ||
+      reference.externalTransactionId !== this.referenceExternalTransactionId ||
+      reference.providerId !== this.providerId ||
+      reference.playerId !== this.playerId ||
+      reference.walletId !== this.walletId ||
+      reference.money.currency !== this.money.currency ||
+      reference.roundId !== this.roundId
+    ) {
+      throw new InvalidTransactionReferenceError(FailureCode.ReferenceMismatch);
+    }
+
+    const allowedKinds: WagerTransactionKind[] =
+      this.kind === WagerTransactionKind.Rollback
+        ? [
+            WagerTransactionKind.Bet,
+            WagerTransactionKind.Win,
+            WagerTransactionKind.Refund,
+          ]
+        : this.kind === WagerTransactionKind.Refund ||
+            this.kind === WagerTransactionKind.Win ||
+            this.kind === WagerTransactionKind.Loss
+          ? [WagerTransactionKind.Bet]
+          : [];
+
+    if (!allowedKinds.includes(reference.kind)) {
+      throw new InvalidTransactionReferenceError(
+        FailureCode.InvalidReferenceKind,
+      );
+    }
+
+    if (reference.status !== WagerTransactionStatus.Processed) {
+      throw new InvalidTransactionReferenceError(
+        FailureCode.ReferenceNotProcessed,
+      );
+    }
+
+    if (this.requiresReference() && !this.money.equals(reference.money)) {
+      throw new InvalidTransactionReferenceError(
+        FailureCode.ReferenceAmountMismatch,
+      );
+    }
+  }
+
+  ledgerDirectionFor(
+    reference?: WagerTransaction,
+  ): LedgerDirection | undefined {
+    if (this.referenceExternalTransactionId !== undefined) {
+      if (reference === undefined) {
+        throw new InvalidTransactionReferenceError(
+          FailureCode.ReferenceNotFound,
+        );
+      }
+
+      this.validateReference(reference);
+    } else if (reference !== undefined) {
+      throw new InvalidTransactionReferenceError(FailureCode.ReferenceMismatch);
+    }
+
+    if (!this.affectsBalance()) {
+      return undefined;
+    }
+
+    switch (this.kind) {
+      case WagerTransactionKind.Bet:
+        return LedgerDirection.Debit;
+
+      case WagerTransactionKind.Opening:
+      case WagerTransactionKind.Win:
+      case WagerTransactionKind.Refund:
+        return LedgerDirection.Credit;
+
+      case WagerTransactionKind.Rollback:
+        if (reference === undefined) {
+          throw new InvalidTransactionReferenceError(
+            FailureCode.ReferenceNotFound,
+          );
+        }
+
+        return reference.kind === WagerTransactionKind.Bet
+          ? LedgerDirection.Credit
+          : LedgerDirection.Debit;
+
+      case WagerTransactionKind.Loss:
+        return undefined;
+    }
   }
 
   matchesPayload(payloadHash: string): boolean {
