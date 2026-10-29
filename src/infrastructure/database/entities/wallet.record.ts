@@ -67,7 +67,7 @@ export const WalletSchema = new EntitySchema<WalletRecord>({
     },
     {
       name: 'wallets_currency_supported',
-      expression: "currency IN ('BRL', 'USD', 'EUR', 'GBP')",
+      expression: "currency ~ '^(BRL|USD|EUR|GBP)$'",
     },
   ],
 });

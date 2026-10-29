@@ -3,6 +3,7 @@ import 'dotenv/config';
 import { Migrator } from '@mikro-orm/migrations';
 import { defineConfig } from '@mikro-orm/postgresql';
 import { WalletSchema } from './entities/wallet.record';
+import { WagerTransactionSchema } from './entities/wager-transaction.record';
 
 const clientUrl = process.env.DATABASE_URL;
 
@@ -12,7 +13,7 @@ if (!clientUrl) {
 
 export default defineConfig({
   clientUrl,
-  entities: [WalletSchema],
+  entities: [WalletSchema, WagerTransactionSchema],
 
   extensions: [Migrator],
 
