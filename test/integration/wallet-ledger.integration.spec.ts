@@ -670,4 +670,53 @@ describe('Wallet ledger PostgreSQL constraints', () => {
       ]);
     },
   );
+  test('rejects a ledger amount different from its transaction', async () => {
+    await expectDatabaseFailure(
+      () =>
+        insertEntry({
+          amount: '99.00',
+          balanceAfter: '99.00',
+        }),
+      {
+        code: '23514',
+        constraint: 'ledger_transaction_consistent',
+      },
+    );
+  });
+
+  test('rejects a supported currency different from its transaction', async () => {
+    await expectDatabaseFailure(() => insertEntry({ currency: 'GBP' }), {
+      code: '23514',
+      constraint: 'ledger_transaction_consistent',
+    });
+  });
+
+  test('rejects a direction incompatible with an opening credit', async () => {
+    await expectDatabaseFailure(
+      () =>
+        insertEntry({
+          direction: 'DEBIT',
+          balanceBefore: '200.00',
+          balanceAfter: '100.00',
+        }),
+      {
+        code: '23514',
+        constraint: 'ledger_transaction_consistent',
+      },
+    );
+  });
+
+  test('rejects a balance different from the original transaction result', async () => {
+    await expectDatabaseFailure(
+      () =>
+        insertEntry({
+          balanceBefore: '100.00',
+          balanceAfter: '200.00',
+        }),
+      {
+        code: '23514',
+        constraint: 'ledger_transaction_consistent',
+      },
+    );
+  });
 });
