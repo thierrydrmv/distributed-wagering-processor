@@ -719,4 +719,79 @@ describe('Wallet ledger PostgreSQL constraints', () => {
       },
     );
   });
+
+  test('rejects a processed financial transaction without a ledger entry', async () => {
+    // O beforeEach cria OPENING processado, ainda sem ledger.
+    await expectDatabaseFailure(
+      () => client.query('SET CONSTRAINTS wager_ledger_required IMMEDIATE'),
+      {
+        code: '23514',
+        constraint: 'wager_ledger_required',
+      },
+    );
+  });
+
+  test('accepts a processed transaction after its ledger is inserted', async () => {
+    await insertEntry();
+
+    await client.query('SET CONSTRAINTS wager_ledger_required IMMEDIATE');
+
+    const result = await client.query<{ count: string }>(
+      `
+      select count(*) as count
+      from wallet_ledger_entries
+      where transaction_id = $1
+    `,
+      [transactionId],
+    );
+
+    expect(result.rows[0]?.count).toBe('1');
+  });
+
+  test('accepts a processed LOSS without a ledger entry', async () => {
+    // Completa a abertura antes de verificar todas as operações.
+    await insertEntry();
+
+    const lossId = randomUUID();
+
+    await client.query(
+      `
+      insert into wager_transactions (
+        id, provider_id, external_transaction_id,
+        idempotency_key, payload_hash,
+        wallet_id, player_id, round_id, game_id,
+        kind, amount, currency, status,
+        result_balance, created_at, processed_at
+      )
+      select
+        $1::uuid, 'provider-a', $2::text,
+        $3::text, $4::text,
+        id, player_id, 'round-1', 'game-1',
+        'LOSS', '0.00', currency, 'PROCESSED',
+        '100.00', now(), now()
+      from wallets
+      where id = $5::uuid
+    `,
+      [
+        lossId,
+        `loss:${lossId}`,
+        `provider-a:loss:${lossId}`,
+        'e'.repeat(64),
+        walletId,
+      ],
+    );
+
+    await client.query('SET CONSTRAINTS wager_ledger_required IMMEDIATE');
+
+    const result = await client.query<{ count: string }>(
+      `
+      select count(*) as count
+      from wallet_ledger_entries
+      where transaction_id = $1
+    `,
+      [lossId],
+    );
+
+    expect(result.rows[0]?.count).toBe('0');
+  });
 });
