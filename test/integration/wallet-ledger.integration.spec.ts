@@ -268,6 +268,7 @@ describe('Wallet ledger PostgreSQL constraints', () => {
     async (operation) => {
       const entryId = randomUUID();
       await insertEntry({ id: entryId });
+      await client.query('SET CONSTRAINTS ALL IMMEDIATE');
 
       const statements: Record<string, string> = {
         UPDATE: `
@@ -668,8 +669,11 @@ describe('Wallet ledger PostgreSQL constraints', () => {
           calculated_balance: '100.00',
         },
       ]);
+
+      await client.query('SET CONSTRAINTS ALL IMMEDIATE');
     },
   );
+
   test('rejects a ledger amount different from its transaction', async () => {
     await expectDatabaseFailure(
       () =>
@@ -793,5 +797,96 @@ describe('Wallet ledger PostgreSQL constraints', () => {
     );
 
     expect(result.rows[0]?.count).toBe('0');
+  });
+
+  test('accepts a wallet consistent with its opening ledger', async () => {
+    await insertEntry();
+
+    await client.query('SET CONSTRAINTS ALL IMMEDIATE');
+
+    const result = await client.query<{
+      balance: string;
+      version: number;
+    }>('select balance, version from wallets where id = $1', [walletId]);
+
+    expect(result.rows).toEqual([
+      {
+        balance: '100.00',
+        version: 1,
+      },
+    ]);
+  });
+
+  test('rejects a balance change without a corresponding movement', async () => {
+    await insertEntry();
+
+    await client.query(
+      `
+      update wallets
+      set balance = '75.00', version = 2, updated_at = now()
+      where id = $1
+    `,
+      [walletId],
+    );
+
+    await expectDatabaseFailure(
+      () => client.query('SET CONSTRAINTS ALL IMMEDIATE'),
+      {
+        code: '23514',
+        constraint: 'wallet_balance_matches_ledger',
+      },
+    );
+  });
+
+  test('rejects a version increment without a financial movement', async () => {
+    await insertEntry();
+
+    await client.query(
+      `
+      update wallets
+      set version = 2
+      where id = $1
+    `,
+      [walletId],
+    );
+
+    await expectDatabaseFailure(
+      () => client.query('SET CONSTRAINTS ALL IMMEDIATE'),
+      {
+        code: '23514',
+        constraint: 'wallet_version_matches_ledger',
+      },
+    );
+  });
+
+  test('accepts a zero-balance wallet without an opening entry', async () => {
+    await insertEntry();
+
+    const emptyWalletId = randomUUID();
+
+    await client.query(
+      `
+      insert into wallets (
+        id, player_id, currency, balance,
+        version, created_at, updated_at
+      )
+      values ($1, $2, 'GBP', '0.00', 1, now(), now())
+    `,
+      [emptyWalletId, randomUUID()],
+    );
+
+    await client.query('SET CONSTRAINTS ALL IMMEDIATE');
+
+    const result = await client.query<{
+      balance: string;
+      version: number;
+    }>('select balance, version from wallets where id = $1', [emptyWalletId]);
+
+    expect(result.rows).toEqual([
+      {
+        balance: '0.00',
+        version: 1,
+      },
+    ]);
   });
 });
