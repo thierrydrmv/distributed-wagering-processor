@@ -889,4 +889,129 @@ describe('Wallet ledger PostgreSQL constraints', () => {
       },
     ]);
   });
+
+  test.each([
+    {
+      field: 'id',
+      assignment: 'id = $2::uuid',
+      value: randomUUID(),
+    },
+    {
+      field: 'player_id',
+      assignment: 'player_id = $2::uuid',
+      value: randomUUID(),
+    },
+    {
+      field: 'currency',
+      assignment: 'currency = $2::varchar',
+      value: 'GBP',
+    },
+    {
+      field: 'created_at',
+      assignment: 'created_at = $2::timestamptz',
+      value: '2020-01-01T00:00:00.000Z',
+    },
+  ])('prevents changing wallet $field', async ({ assignment, value }) => {
+    await expectDatabaseFailure(
+      () =>
+        client.query(
+          `
+          update wallets
+          set ${assignment}
+          where id = $1
+        `,
+          [walletId, value],
+        ),
+      {
+        code: '23514',
+        constraint: 'wallet_identity_immutable',
+      },
+    );
+  });
+
+  test('rejects NaN as a wallet balance', async () => {
+    await expectDatabaseFailure(
+      () =>
+        client.query(
+          `
+          update wallets
+          set balance = 'NaN'::numeric
+          where id = $1
+        `,
+          [walletId],
+        ),
+      {
+        code: '23514',
+        constraint: 'wallets_balance_finite',
+      },
+    );
+  });
+
+  test('rejects NaN as a transaction amount', async () => {
+    const id = randomUUID();
+
+    await expectDatabaseFailure(
+      () =>
+        client.query(
+          `
+          insert into wager_transactions (
+            id, provider_id, external_transaction_id,
+            idempotency_key, payload_hash,
+            wallet_id, player_id, round_id, game_id,
+            kind, amount, currency, status, created_at
+          )
+          select
+            $1::uuid, 'provider-a', $2::text,
+            $3::text, $4::text,
+            id, player_id, 'round-1', 'game-1',
+            'BET', 'NaN'::numeric, currency, 'PENDING', now()
+          from wallets
+          where id = $5::uuid
+        `,
+          [id, `bet:${id}`, `provider-a:bet:${id}`, 'e'.repeat(64), walletId],
+        ),
+      {
+        code: '23514',
+        constraint: 'wager_transactions_money_finite',
+      },
+    );
+  });
+
+  test('rejects a second processed opening for the same wallet', async () => {
+    const duplicateId = randomUUID();
+
+    await expectDatabaseFailure(
+      () =>
+        client.query(
+          `
+          insert into wager_transactions (
+            id, provider_id, external_transaction_id,
+            idempotency_key, payload_hash,
+            wallet_id, player_id, round_id, game_id,
+            kind, amount, currency, status,
+            result_balance, created_at, processed_at
+          )
+          select
+            $1::uuid, 'internal', $2::text,
+            $3::text, $4::text,
+            id, player_id, 'opening', 'internal',
+            'OPENING', '100.00', currency, 'PROCESSED',
+            '100.00', now(), now()
+          from wallets
+          where id = $5::uuid
+        `,
+          [
+            duplicateId,
+            `opening:${duplicateId}`,
+            `internal:opening:${duplicateId}`,
+            'f'.repeat(64),
+            walletId,
+          ],
+        ),
+      {
+        code: '23505',
+        constraint: 'wager_transactions_opening_unique',
+      },
+    );
+  });
 });
