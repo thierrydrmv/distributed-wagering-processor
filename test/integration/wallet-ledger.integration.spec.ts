@@ -306,4 +306,368 @@ describe('Wallet ledger PostgreSQL constraints', () => {
       expect(result.rows).toEqual([{ amount: '100.00' }]);
     },
   );
+
+  test('blocks updates to a processed transaction', async () => {
+    await insertEntry();
+
+    await expectDatabaseFailure(
+      () =>
+        client.query(
+          `
+          update wager_transactions
+          set result_balance = '50.00'
+          where id = $1
+        `,
+          [transactionId],
+        ),
+      {
+        code: '23514',
+        constraint: 'wager_transaction_terminal',
+      },
+    );
+
+    const result = await client.query<{
+      status: string;
+      result_balance: string;
+    }>(
+      `
+      select status, result_balance
+      from wager_transactions
+      where id = $1
+    `,
+      [transactionId],
+    );
+
+    expect(result.rows).toEqual([
+      {
+        status: 'PROCESSED',
+        result_balance: '100.00',
+      },
+    ]);
+  });
+
+  test('blocks removal of transaction history', async () => {
+    await expectDatabaseFailure(
+      () =>
+        client.query('delete from wager_transactions where id = $1', [
+          transactionId,
+        ]),
+      {
+        code: '23514',
+        constraint: 'wager_transactions_immutable',
+      },
+    );
+  });
+
+  test('allows rejecting a pending transaction but preserves its payload', async () => {
+    const pendingId = randomUUID();
+
+    await client.query(
+      `
+      insert into wager_transactions (
+        id, provider_id, external_transaction_id,
+        idempotency_key, payload_hash,
+        wallet_id, player_id, round_id, game_id,
+        kind, amount, currency, status, created_at
+      )
+      select
+        $1::uuid, 'provider-a', $2::text,
+        $3::text, $4::text,
+        id, player_id, 'round-1', 'game-1',
+        'BET', '25.00', currency, 'PENDING', now()
+      from wallets
+      where id = $5::uuid
+    `,
+      [
+        pendingId,
+        `bet:${pendingId}`,
+        `provider-a:bet:${pendingId}`,
+        'b'.repeat(64),
+        walletId,
+      ],
+    );
+
+    await expectDatabaseFailure(
+      () =>
+        client.query(
+          `
+          update wager_transactions
+          set amount = '50.00'
+          where id = $1
+        `,
+          [pendingId],
+        ),
+      {
+        code: '23514',
+        constraint: 'wager_transaction_identity_immutable',
+      },
+    );
+
+    await client.query(
+      `
+      update wager_transactions
+      set
+        status = 'REJECTED',
+        failure_code = 'INSUFFICIENT_BALANCE',
+        result_balance = '10.00'
+      where id = $1
+    `,
+      [pendingId],
+    );
+
+    const result = await client.query<{
+      status: string;
+      amount: string;
+    }>(
+      `
+      select status, amount
+      from wager_transactions
+      where id = $1
+    `,
+      [pendingId],
+    );
+
+    expect(result.rows).toEqual([
+      {
+        status: 'REJECTED',
+        amount: '25.00',
+      },
+    ]);
+
+    await expectDatabaseFailure(
+      () =>
+        client.query(
+          `
+          update wager_transactions
+          set failure_code = 'REFERENCE_NOT_FOUND'
+          where id = $1
+        `,
+          [pendingId],
+        ),
+      {
+        code: '23514',
+        constraint: 'wager_transaction_terminal',
+      },
+    );
+  });
+
+  test.each(['REFUND', 'ROLLBACK'])(
+    'allows only one processed %s per reference',
+    async (kind) => {
+      // Registra o crédito de abertura criado no beforeEach.
+      await insertEntry();
+
+      const betId = randomUUID();
+      const betExternalId = `bet:${betId}`;
+
+      await client.query(
+        `
+        insert into wager_transactions (
+          id, provider_id, external_transaction_id,
+          idempotency_key, payload_hash,
+          wallet_id, player_id, round_id, game_id,
+          kind, amount, currency, status,
+          result_balance, created_at, processed_at
+        )
+        select
+          $1::uuid, 'provider-a', $2::text,
+          $3::text, $4::text,
+          id, player_id, 'round-1', 'game-1',
+          'BET', '25.00', currency, 'PROCESSED',
+          '75.00', now(), now()
+        from wallets
+        where id = $5::uuid
+      `,
+        [
+          betId,
+          betExternalId,
+          `provider-a:${betExternalId}`,
+          'c'.repeat(64),
+          walletId,
+        ],
+      );
+
+      await client.query(
+        `
+        update wallets
+        set balance = '75.00', version = 2, updated_at = now()
+        where id = $1
+      `,
+        [walletId],
+      );
+
+      await client.query(
+        `
+        insert into wallet_ledger_entries (
+          id, wallet_id, transaction_id, direction,
+          amount, currency, balance_before,
+          balance_after, created_at
+        )
+        values (
+          $1, $2, $3, 'DEBIT',
+          '25.00', 'BRL', '100.00', '75.00', now()
+        )
+      `,
+        [randomUUID(), walletId, betId],
+      );
+
+      const createPendingReversal = async (): Promise<string> => {
+        const id = randomUUID();
+        const externalId = `reversal:${id}`;
+
+        await client.query(
+          `
+          insert into wager_transactions (
+            id, provider_id, external_transaction_id,
+            idempotency_key, payload_hash,
+            wallet_id, player_id, round_id, game_id,
+            kind, amount, currency,
+            reference_external_transaction_id,
+            status, created_at
+          )
+          select
+            $1::uuid, 'provider-a', $2::text,
+            $3::text, $4::text,
+            id, player_id, 'round-1', 'game-1',
+            $5::text, '25.00', currency,
+            $6::text, 'PENDING', now()
+          from wallets
+          where id = $7::uuid
+        `,
+          [
+            id,
+            externalId,
+            `provider-a:${externalId}`,
+            'd'.repeat(64),
+            kind,
+            betExternalId,
+            walletId,
+          ],
+        );
+
+        return id;
+      };
+
+      // Uma rejeição anterior não pode consumir o direito de reverter.
+      const rejectedId = await createPendingReversal();
+
+      await client.query(
+        `
+        update wager_transactions
+        set
+          status = 'REJECTED',
+          failure_code = 'REFERENCE_NOT_PROCESSED',
+          result_balance = '75.00'
+        where id = $1
+      `,
+        [rejectedId],
+      );
+
+      const firstId = await createPendingReversal();
+
+      await client.query(
+        `
+        update wager_transactions
+        set
+          status = 'PROCESSED',
+          reference_transaction_id = $2,
+          result_balance = '100.00',
+          processed_at = now()
+        where id = $1
+      `,
+        [firstId, betId],
+      );
+
+      await client.query(
+        `
+        update wallets
+        set balance = '100.00', version = 3, updated_at = now()
+        where id = $1
+      `,
+        [walletId],
+      );
+
+      await client.query(
+        `
+        insert into wallet_ledger_entries (
+          id, wallet_id, transaction_id, direction,
+          amount, currency, balance_before,
+          balance_after, created_at
+        )
+        values (
+          $1, $2, $3, 'CREDIT',
+          '25.00', 'BRL', '75.00', '100.00', now()
+        )
+      `,
+        [randomUUID(), walletId, firstId],
+      );
+
+      const duplicateId = await createPendingReversal();
+
+      await expectDatabaseFailure(
+        () =>
+          client.query(
+            `
+            update wager_transactions
+            set
+              status = 'PROCESSED',
+              reference_transaction_id = $2,
+              result_balance = '100.00',
+              processed_at = now()
+            where id = $1
+          `,
+            [duplicateId, betId],
+          ),
+        {
+          code: '23505',
+          constraint: 'wager_transactions_processed_reversal_unique',
+        },
+      );
+
+      const processed = await client.query<{ count: string }>(
+        `
+        select count(*) as count
+        from wager_transactions
+        where
+          reference_transaction_id = $1
+          and kind = $2
+          and status = 'PROCESSED'
+      `,
+        [betId, kind],
+      );
+
+      expect(processed.rows[0]?.count).toBe('1');
+
+      const reconciliation = await client.query<{
+        balance: string;
+        calculated_balance: string;
+      }>(
+        `
+        select
+          w.balance,
+          coalesce(
+            sum(
+              case
+                when l.direction = 'CREDIT' then l.amount
+                else -l.amount
+              end
+            ),
+            0
+          )::numeric(20,2) as calculated_balance
+        from wallets w
+        left join wallet_ledger_entries l on l.wallet_id = w.id
+        where w.id = $1
+        group by w.id, w.balance
+      `,
+        [walletId],
+      );
+
+      expect(reconciliation.rows).toEqual([
+        {
+          balance: '100.00',
+          calculated_balance: '100.00',
+        },
+      ]);
+    },
+  );
 });
