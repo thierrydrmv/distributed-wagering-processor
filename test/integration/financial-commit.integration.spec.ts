@@ -5,6 +5,25 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { MikroORM } from '@mikro-orm/postgresql';
 import { Client } from 'pg';
 import ormConfig from '../../src/infrastructure/database/mikro-orm.config';
+import { Wallet } from '../../src/domain/entities/wallet';
+import { Money } from '../../src/domain/value-objects/money';
+import { MikroOrmFinancialUnitOfWork } from '../../src/infrastructure/database/mikro-orm-financial-unit-of-work';
+
+async function captureFailure(action: () => Promise<unknown>): Promise<Error> {
+  try {
+    await action();
+  } catch (error) {
+    if (error instanceof Error) {
+      return error;
+    }
+
+    throw new Error('Operation rejected with a non-Error value', {
+      cause: error,
+    });
+  }
+
+  throw new Error('Expected operation to fail, but it succeeded');
+}
 
 describe('Financial consistency at real commit', () => {
   const databaseName = `wagering_commit_${randomUUID().replaceAll('-', '')}_test`;
@@ -14,6 +33,7 @@ describe('Financial consistency at real commit', () => {
   let adminConnected = false;
   let clientConnected = false;
   let databaseCreated = false;
+  let applicationOrm: MikroORM;
 
   beforeAll(async () => {
     const connectionString = process.env.TEST_DATABASE_URL;
@@ -54,12 +74,22 @@ describe('Financial consistency at real commit', () => {
     client = new Client({ connectionString: temporaryUrl });
     await client.connect();
     clientConnected = true;
+
+    applicationOrm = await MikroORM.init({
+      ...ormConfig,
+      clientUrl: temporaryUrl,
+      dbName: databaseName,
+    });
   }, 30_000);
 
   afterAll(async () => {
     try {
       if (clientConnected) {
         await client.end();
+      }
+
+      if (applicationOrm) {
+        await applicationOrm.close(true);
       }
 
       if (databaseCreated && adminConnected) {
@@ -234,4 +264,91 @@ describe('Financial consistency at real commit', () => {
       }
     },
   );
+  test('unit of work commits a zero-balance wallet', async () => {
+    const uow = new MikroOrmFinancialUnitOfWork(applicationOrm);
+    const walletId = randomUUID();
+
+    const wallet = Wallet.open({
+      id: walletId,
+      playerId: randomUUID(),
+      initialBalance: Money.zero('BRL'),
+      at: new Date(),
+    });
+
+    const result = await uow.execute(async ({ wallets }) => {
+      await wallets.insert(wallet);
+
+      return wallet.id;
+    });
+
+    expect(result).toBe(walletId);
+
+    const persisted = await client.query<{
+      balance: string;
+      version: number;
+    }>('select balance, version from wallets where id = $1', [walletId]);
+
+    expect(persisted.rows).toEqual([{ balance: '0.00', version: 1 }]);
+  });
+
+  test('unit of work rolls back when its callback fails', async () => {
+    const uow = new MikroOrmFinancialUnitOfWork(applicationOrm);
+    const walletId = randomUUID();
+
+    const wallet = Wallet.open({
+      id: walletId,
+      playerId: randomUUID(),
+      initialBalance: Money.zero('BRL'),
+      at: new Date(),
+    });
+
+    const error = await captureFailure(() =>
+      uow.execute(async ({ wallets }) => {
+        await wallets.insert(wallet);
+
+        throw new Error('Forced callback failure');
+      }),
+    );
+
+    expect(error.message).toContain('Forced callback failure');
+
+    const persisted = await client.query<{ count: string }>(
+      'select count(*) as count from wallets where id = $1',
+      [walletId],
+    );
+
+    expect(persisted.rows[0]?.count).toBe('0');
+  });
+
+  test('unit of work propagates deferred commit failures', async () => {
+    const uow = new MikroOrmFinancialUnitOfWork(applicationOrm);
+    const walletId = randomUUID();
+
+    const wallet = Wallet.open({
+      id: walletId,
+      playerId: randomUUID(),
+      initialBalance: Money.from({
+        amount: '100.00',
+        currency: 'BRL',
+      }),
+      at: new Date(),
+    });
+
+    const error = await captureFailure(() =>
+      uow.execute(async ({ wallets }) => {
+        await wallets.insert(wallet);
+
+        return wallet.id;
+      }),
+    );
+
+    expect(error.message).toContain('Wallet balance differs from its ledger');
+
+    const persisted = await client.query<{ count: string }>(
+      'select count(*) as count from wallets where id = $1',
+      [walletId],
+    );
+
+    expect(persisted.rows[0]?.count).toBe('0');
+  });
 });
