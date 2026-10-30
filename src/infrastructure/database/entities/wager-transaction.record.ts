@@ -26,6 +26,10 @@ export class WagerTransactionRecord {
   resultBalance!: string | null;
   createdAt!: Date;
   processedAt!: Date | null;
+  referenceAttempts!: number;
+  nextReferenceAttemptAt!: Date;
+  referenceClaimToken!: string | null;
+  referenceClaimedUntil!: Date | null;
 }
 
 export const WagerTransactionSchema = new EntitySchema<WagerTransactionRecord>({
@@ -131,6 +135,28 @@ export const WagerTransactionSchema = new EntitySchema<WagerTransactionRecord>({
       fieldName: 'processed_at',
       nullable: true,
     },
+    referenceAttempts: {
+      type: 'integer',
+      fieldName: 'reference_attempts',
+      default: 0,
+    },
+    nextReferenceAttemptAt: {
+      type: 'Date',
+      columnType: 'timestamptz',
+      fieldName: 'next_reference_attempt_at',
+      defaultRaw: 'now()',
+    },
+    referenceClaimToken: {
+      type: 'uuid',
+      fieldName: 'reference_claim_token',
+      nullable: true,
+    },
+    referenceClaimedUntil: {
+      type: 'Date',
+      columnType: 'timestamptz',
+      fieldName: 'reference_claimed_until',
+      nullable: true,
+    },
   },
 
   uniques: [
@@ -156,6 +182,10 @@ export const WagerTransactionSchema = new EntitySchema<WagerTransactionRecord>({
     {
       name: 'wager_transactions_reference_idx',
       properties: ['referenceTransactionId'],
+    },
+    {
+      name: 'wager_reference_retry_idx',
+      properties: ['status', 'nextReferenceAttemptAt', 'id'],
     },
   ],
 
@@ -210,6 +240,10 @@ export const WagerTransactionSchema = new EntitySchema<WagerTransactionRecord>({
             AND failure_code IS NULL
           )
         `,
+    },
+    {
+      name: 'wager_reference_attempts_non_negative',
+      expression: 'reference_attempts >= 0',
     },
   ],
 });

@@ -25,6 +25,7 @@ import {
   ProcessWagerRequest,
   ProcessWagerTransaction,
 } from 'src/application/use-cases/process-wager-transaction';
+import { ReferenceRetryWorker } from 'src/infrastructure/workers/reference-retry.worker';
 async function captureFailure(action: () => Promise<unknown>): Promise<Error> {
   try {
     await action();
@@ -928,5 +929,156 @@ describe('Financial consistency at real commit', () => {
     );
 
     expect(persisted.rows).toEqual([{ balance: '100.00' }]);
+  });
+
+  test('reference worker resumes a refund after its BET arrives', async () => {
+    const { processor, wallet, request } = await wageringFixture();
+
+    const bet = request();
+
+    const pending = await processor.execute(
+      request({
+        kind: WagerTransactionKind.Refund,
+        referenceExternalTransactionId: bet.externalTransactionId,
+      }),
+    );
+
+    expect(pending.status).toBe(WagerTransactionStatus.PendingReference);
+
+    await processor.execute(bet);
+
+    const worker = new ReferenceRetryWorker(applicationOrm, processor);
+
+    await worker.runOnce();
+
+    const stored = await client.query<{
+      status: string;
+      result_balance: string;
+    }>(
+      `
+      select status, result_balance
+      from wager_transactions
+      where id = $1
+    `,
+      [pending.transactionId],
+    );
+
+    expect(stored.rows).toEqual([
+      { status: 'PROCESSED', result_balance: '100.00' },
+    ]);
+
+    const balance = await client.query<{ balance: string }>(
+      'select balance from wallets where id = $1',
+      [wallet.id],
+    );
+
+    expect(balance.rows).toEqual([{ balance: '100.00' }]);
+
+    // Uma segunda execução não pode repetir o crédito.
+    await worker.runOnce();
+
+    const entries = await client.query<{ count: string }>(
+      `
+      select count(*) as count
+      from wallet_ledger_entries
+      where transaction_id = $1
+    `,
+      [pending.transactionId],
+    );
+
+    expect(entries.rows[0]?.count).toBe('1');
+  });
+
+  test('reference worker persists backoff and rejects expired references', async () => {
+    const { processor, request } = await wageringFixture();
+
+    const pending = await processor.execute(
+      request({
+        kind: WagerTransactionKind.Refund,
+        referenceExternalTransactionId: randomUUID(),
+      }),
+    );
+
+    const worker = new ReferenceRetryWorker(applicationOrm, processor);
+
+    const due = await client.query<{ due_at_ms: string }>(
+      `
+    select
+      ceil(
+        extract(epoch from next_reference_attempt_at) * 1000
+      )::text as due_at_ms
+    from wager_transactions
+    where id = $1
+  `,
+      [pending.transactionId],
+    );
+
+    const dueAtMs = Number(due.rows[0]?.due_at_ms);
+
+    if (!Number.isSafeInteger(dueAtMs)) {
+      throw new Error('Missing or invalid reference retry timestamp');
+    }
+
+    // Executa depois do horário agendado, sem depender de espera.
+    const now = new Date(dueAtMs + 1);
+
+    await worker.runOnce(now);
+
+    const scheduled = await client.query<{
+      reference_attempts: number;
+      next_reference_attempt_at: Date;
+      reference_claim_token: string | null;
+    }>(
+      `
+      select
+        reference_attempts,
+        next_reference_attempt_at,
+        reference_claim_token
+      from wager_transactions
+      where id = $1
+    `,
+      [pending.transactionId],
+    );
+
+    expect(scheduled.rows[0]?.reference_attempts).toBe(1);
+    expect(scheduled.rows[0]?.next_reference_attempt_at.getTime()).toBe(
+      now.getTime() + 1_000,
+    );
+    expect(scheduled.rows[0]?.reference_claim_token).toBeNull();
+
+    // Avança o relógio fornecido ao worker sem esperar quinze minutos.
+    await worker.runOnce(new Date(now.getTime() + 16 * 60 * 1_000));
+
+    const rejected = await client.query<{
+      status: string;
+      failure_code: string;
+    }>(
+      `
+      select status, failure_code
+      from wager_transactions
+      where id = $1
+    `,
+      [pending.transactionId],
+    );
+
+    expect(rejected.rows).toEqual([
+      {
+        status: 'REJECTED',
+        failure_code: 'REFERENCE_NOT_FOUND',
+      },
+    ]);
+
+    const events = await client.query<{ count: string }>(
+      `
+      select count(*) as count
+      from outbox_messages
+      where
+        event_type = 'WagerTransactionRejected'
+        and payload->'data'->>'transactionId' = $1
+    `,
+      [pending.transactionId],
+    );
+
+    expect(events.rows[0]?.count).toBe('1');
   });
 });

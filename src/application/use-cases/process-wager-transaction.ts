@@ -177,6 +177,62 @@ export class ProcessWagerTransaction {
     throw new Error('Transaction retry limit exhausted');
   }
 
+  async resumePendingReference(
+    transactionId: string,
+    expired = false,
+  ): Promise<ProcessWagerResponse> {
+    return this.uow.execute(async (context) => {
+      const initial = await context.transactions.findById(transactionId);
+
+      if (initial === null) {
+        throw new WageringError(
+          'TRANSACTION_NOT_FOUND',
+          'Transaction does not exist',
+        );
+      }
+
+      const wallet = await context.wallets.findByIdForUpdate(
+        initial.transaction.walletId,
+      );
+
+      if (wallet === null) {
+        throw new WageringError('WALLET_NOT_FOUND', 'Wallet does not exist');
+      }
+
+      const current = await context.transactions.findById(transactionId);
+
+      if (current === null) {
+        throw new WageringError(
+          'TRANSACTION_NOT_FOUND',
+          'Transaction does not exist',
+        );
+      }
+
+      if (
+        current.transaction.status !== WagerTransactionStatus.PendingReference
+      ) {
+        return this.response(current.transaction, current.resultBalance, true);
+      }
+
+      if (expired) {
+        return this.reject(
+          context,
+          current.transaction,
+          FailureCode.ReferenceNotFound,
+          wallet.balance,
+          {
+            eventId: randomUUID(),
+            correlationId: transactionId,
+            causationId: transactionId,
+            occurredAt: new Date(),
+          },
+        );
+      }
+
+      return this.apply(context, current.transaction, wallet, transactionId);
+    });
+  }
+
   private async apply(
     context: FinancialTransactionContext,
     transaction: WagerTransaction,
@@ -367,6 +423,11 @@ export class ProcessWagerTransaction {
     transaction: WagerTransaction,
     eventContext: EventContext,
   ): Promise<ProcessWagerResponse> {
+    // Não gera outro evento em cada tentativa sem referência.
+    if (transaction.status === WagerTransactionStatus.PendingReference) {
+      return this.response(transaction, null, false);
+    }
+
     transaction.markPendingReference();
 
     await context.transactions.save(transaction);
