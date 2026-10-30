@@ -9,8 +9,10 @@ import { Wallet } from '../../src/domain/entities/wallet';
 import { Money } from '../../src/domain/value-objects/money';
 import { MikroOrmFinancialUnitOfWork } from '../../src/infrastructure/database/mikro-orm-financial-unit-of-work';
 import {
+  FailureCode,
   WagerTransaction,
   WagerTransactionKind,
+  WagerTransactionStatus,
 } from '../../src/domain/entities/wager-transaction';
 import {
   LedgerDirection,
@@ -19,6 +21,10 @@ import {
 import { OutboxMessage } from 'src/application/outbox/outbox-message';
 import { WalletBalanceChanged } from 'src/application/events/wallet-balance-changed';
 import { OpenWallet } from 'src/application/use-cases/open-wallet';
+import {
+  ProcessWagerRequest,
+  ProcessWagerTransaction,
+} from 'src/application/use-cases/process-wager-transaction';
 async function captureFailure(action: () => Promise<unknown>): Promise<Error> {
   try {
     await action();
@@ -44,6 +50,41 @@ describe('Financial consistency at real commit', () => {
   let clientConnected = false;
   let databaseCreated = false;
   let applicationOrm: MikroORM;
+
+  const wageringFixture = async () => {
+    const uow = new MikroOrmFinancialUnitOfWork(applicationOrm);
+    const playerId = randomUUID();
+
+    const wallet = await new OpenWallet(uow).execute({
+      playerId,
+      initialBalance: { amount: '100.00', currency: 'BRL' },
+    });
+
+    const request = (
+      overrides: Partial<ProcessWagerRequest> = {},
+    ): ProcessWagerRequest => {
+      const externalTransactionId = randomUUID();
+
+      return {
+        providerId: 'provider-a',
+        externalTransactionId,
+        idempotencyKey: `provider-a:${externalTransactionId}`,
+        playerId,
+        walletId: wallet.id,
+        roundId: 'round-1',
+        gameId: 'game-1',
+        kind: WagerTransactionKind.Bet,
+        money: { amount: '25.00', currency: 'BRL' },
+        ...overrides,
+      };
+    };
+
+    return {
+      processor: new ProcessWagerTransaction(uow),
+      wallet,
+      request,
+    };
+  };
 
   beforeAll(async () => {
     const connectionString = process.env.TEST_DATABASE_URL;
@@ -702,5 +743,190 @@ describe('Financial consistency at real commit', () => {
         events: '2',
       },
     ]);
+  });
+
+  test('processes fifty parallel copies with one debit', async () => {
+    const { processor, wallet, request } = await wageringFixture();
+    const input = request();
+
+    const results = await Promise.all(
+      Array.from({ length: 50 }, () => processor.execute(input)),
+    );
+
+    expect(results.filter((result) => !result.idempotentReplay)).toHaveLength(
+      1,
+    );
+
+    expect(new Set(results.map((result) => result.transactionId)).size).toBe(1);
+
+    const persisted = await client.query<{
+      balance: string;
+      debits: string;
+    }>(
+      `
+      select
+        w.balance,
+        (
+          select count(*)
+          from wallet_ledger_entries
+          where wallet_id = w.id and direction = 'DEBIT'
+        ) as debits
+      from wallets w
+      where w.id = $1
+    `,
+      [wallet.id],
+    );
+
+    expect(persisted.rows).toEqual([{ balance: '75.00', debits: '1' }]);
+  });
+
+  test('two concurrent bets cannot overspend the wallet', async () => {
+    const { processor, wallet, request } = await wageringFixture();
+
+    const results = await Promise.all([
+      processor.execute(
+        request({ money: { amount: '80.00', currency: 'BRL' } }),
+      ),
+      processor.execute(
+        request({ money: { amount: '80.00', currency: 'BRL' } }),
+      ),
+    ]);
+
+    expect(
+      results.filter(
+        (result) => result.status === WagerTransactionStatus.Processed,
+      ),
+    ).toHaveLength(1);
+
+    expect(
+      results.filter(
+        (result) =>
+          result.status === WagerTransactionStatus.Rejected &&
+          result.failureCode === FailureCode.InsufficientBalance,
+      ),
+    ).toHaveLength(1);
+
+    const persisted = await client.query<{ balance: string }>(
+      'select balance from wallets where id = $1',
+      [wallet.id],
+    );
+
+    expect(persisted.rows).toEqual([{ balance: '20.00' }]);
+  });
+
+  test('replay returns the original balance after later movements', async () => {
+    const { processor, request } = await wageringFixture();
+    const bet = request();
+
+    const original = await processor.execute(bet);
+
+    await processor.execute(
+      request({
+        kind: WagerTransactionKind.Win,
+        money: { amount: '10.00', currency: 'BRL' },
+      }),
+    );
+
+    const replay = await processor.execute(bet);
+
+    expect(original.balance?.amount).toBe('75.00');
+    expect(replay.balance?.amount).toBe('75.00');
+    expect(replay.transactionId).toBe(original.transactionId);
+    expect(replay.idempotentReplay).toBe(true);
+
+    const error = await captureFailure(() =>
+      processor.execute({
+        ...bet,
+        money: { amount: '26.00', currency: 'BRL' },
+      }),
+    );
+
+    expect(error).toMatchObject({
+      code: 'IDEMPOTENCY_CONFLICT',
+    });
+  });
+
+  test('processes BET WIN LOSS REFUND and ROLLBACK', async () => {
+    const { processor, wallet, request } = await wageringFixture();
+
+    const bet = request();
+    expect((await processor.execute(bet)).balance?.amount).toBe('75.00');
+
+    const win = request({
+      kind: WagerTransactionKind.Win,
+      money: { amount: '10.00', currency: 'BRL' },
+      referenceExternalTransactionId: bet.externalTransactionId,
+    });
+
+    expect((await processor.execute(win)).balance?.amount).toBe('85.00');
+
+    const loss = await processor.execute(
+      request({
+        kind: WagerTransactionKind.Loss,
+        money: { amount: '0.00', currency: 'BRL' },
+      }),
+    );
+
+    expect(loss.status).toBe(WagerTransactionStatus.Processed);
+    expect(loss.balance?.amount).toBe('85.00');
+
+    const refund = await processor.execute(
+      request({
+        kind: WagerTransactionKind.Refund,
+        referenceExternalTransactionId: bet.externalTransactionId,
+      }),
+    );
+
+    expect(refund.balance?.amount).toBe('110.00');
+
+    const rollback = await processor.execute(
+      request({
+        kind: WagerTransactionKind.Rollback,
+        money: { amount: '10.00', currency: 'BRL' },
+        referenceExternalTransactionId: win.externalTransactionId,
+      }),
+    );
+
+    expect(rollback.balance?.amount).toBe('100.00');
+
+    const duplicateReversal = await processor.execute(
+      request({
+        kind: WagerTransactionKind.Rollback,
+        money: { amount: '10.00', currency: 'BRL' },
+        referenceExternalTransactionId: win.externalTransactionId,
+      }),
+    );
+
+    expect(duplicateReversal.failureCode).toBe(
+      FailureCode.ReferenceAlreadyReversed,
+    );
+
+    const persisted = await client.query<{
+      balance: string;
+      version: number;
+    }>('select balance, version from wallets where id = $1', [wallet.id]);
+
+    expect(persisted.rows).toEqual([{ balance: '100.00', version: 5 }]);
+  });
+
+  test('persists an out-of-order refund without changing balance', async () => {
+    const { processor, wallet, request } = await wageringFixture();
+
+    const result = await processor.execute(
+      request({
+        kind: WagerTransactionKind.Refund,
+        referenceExternalTransactionId: 'not-arrived-yet',
+      }),
+    );
+
+    expect(result.status).toBe(WagerTransactionStatus.PendingReference);
+    expect(result.balance).toBeNull();
+
+    const persisted = await client.query<{ balance: string }>(
+      'select balance from wallets where id = $1',
+      [wallet.id],
+    );
+
+    expect(persisted.rows).toEqual([{ balance: '100.00' }]);
   });
 });

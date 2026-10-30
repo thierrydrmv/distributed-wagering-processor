@@ -1,6 +1,9 @@
 import type { Wallet } from '../../domain/entities/wallet';
 import type { WalletLedgerEntry } from '../../domain/entities/wallet-ledger-entry';
-import type { WagerTransaction } from '../../domain/entities/wager-transaction';
+import type {
+  WagerTransaction,
+  WagerTransactionKind,
+} from '../../domain/entities/wager-transaction';
 import type { Money } from '../../domain/value-objects/money';
 import { OutboxMessage } from '../outbox/outbox-message';
 
@@ -34,6 +37,11 @@ export interface WagerTransactionRepository {
     transaction: WagerTransaction,
     resultBalance?: Money | null,
   ): Promise<void>;
+
+  findProcessedReversal(
+    referenceTransactionId: string,
+    kind: WagerTransactionKind,
+  ): Promise<StoredWagerTransaction | null>;
 }
 
 export interface WalletLedgerRepository {

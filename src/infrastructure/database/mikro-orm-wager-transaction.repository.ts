@@ -6,11 +6,13 @@ import {
 } from '../../application/ports/financial-unit-of-work';
 import type {
   WagerTransaction,
+  WagerTransactionKind,
   WagerTransactionStatus,
 } from '../../domain/entities/wager-transaction';
 import type { Money } from '../../domain/value-objects/money';
 import { WagerTransactionRecord } from '../database/entities/wager-transaction.record';
 import { WagerTransactionMapper } from '../database/mappers/wager-transaction.mapper';
+import { WagerTransactionStatus as TransactionStatus } from '../../domain/entities/wager-transaction';
 
 export class MikroOrmWagerTransactionRepository implements WagerTransactionRepository {
   private readonly loadedStatuses = new Map<string, WagerTransactionStatus>();
@@ -102,5 +104,15 @@ export class MikroOrmWagerTransactionRepository implements WagerTransactionRepos
       transaction: WagerTransactionMapper.toDomain(record),
       resultBalance: WagerTransactionMapper.toResultBalance(record),
     };
+  }
+  async findProcessedReversal(
+    referenceTransactionId: string,
+    kind: WagerTransactionKind,
+  ): Promise<StoredWagerTransaction | null> {
+    return this.findOne({
+      referenceTransactionId,
+      kind,
+      status: TransactionStatus.Processed,
+    });
   }
 }

@@ -31,6 +31,7 @@ export enum FailureCode {
   ReferenceAmountMismatch = 'REFERENCE_AMOUNT_MISMATCH',
   ReferenceAlreadyReversed = 'REFERENCE_ALREADY_REVERSED',
   PermanentInfrastructureFailure = 'PERMANENT_INFRASTRUCTURE_FAILURE',
+  BalanceLimitExceeded = 'BALANCE_LIMIT_EXCEEDED',
 }
 
 export interface CreateWagerTransactionProps {

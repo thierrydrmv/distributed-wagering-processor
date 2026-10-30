@@ -454,7 +454,8 @@
             "INVALID_REFERENCE_KIND",
             "REFERENCE_AMOUNT_MISMATCH",
             "REFERENCE_ALREADY_REVERSED",
-            "PERMANENT_INFRASTRUCTURE_FAILURE"
+            "PERMANENT_INFRASTRUCTURE_FAILURE",
+            "BALANCE_LIMIT_EXCEEDED"
           ],
           "mappedType": "enum"
         },
