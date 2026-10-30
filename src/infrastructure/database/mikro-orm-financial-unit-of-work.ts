@@ -5,6 +5,7 @@ import type { FinancialTransactionContext } from '../../application/ports/financ
 import { MikroOrmWalletRepository } from './repositories/mikro-orm-wallet.repository';
 import { MikroOrmWalletLedgerRepository } from './repositories/mikro-orm-wallet-ledger.repository';
 import { MikroOrmWagerTransactionRepository } from './mikro-orm-wager-transaction.repository';
+import { MikroOrmOutboxRepository } from './repositories/mikro-orm-outbox.repository';
 
 export class MikroOrmFinancialUnitOfWork extends FinancialUnitOfWork {
   constructor(private readonly orm: MikroORM) {
@@ -25,6 +26,7 @@ export class MikroOrmFinancialUnitOfWork extends FinancialUnitOfWork {
           wallets: new MikroOrmWalletRepository(transactionEm),
           transactions: new MikroOrmWagerTransactionRepository(transactionEm),
           ledger: new MikroOrmWalletLedgerRepository(transactionEm),
+          outbox: new MikroOrmOutboxRepository(transactionEm),
         };
 
         return work(context);

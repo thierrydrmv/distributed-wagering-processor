@@ -22,6 +22,176 @@
           "enumItems": [],
           "mappedType": "uuid"
         },
+        "aggregate_id": {
+          "name": "aggregate_id",
+          "type": "uuid",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "uuid"
+        },
+        "event_type": {
+          "name": "event_type",
+          "type": "varchar(255)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": 255,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "string"
+        },
+        "payload": {
+          "name": "payload",
+          "type": "jsonb",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "json"
+        },
+        "occurred_at": {
+          "name": "occurred_at",
+          "type": "timestamptz(6)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": 6,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "datetime"
+        },
+        "attempts": {
+          "name": "attempts",
+          "type": "int4",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": 32,
+          "scale": 0,
+          "default": "0",
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "integer"
+        },
+        "next_attempt_at": {
+          "name": "next_attempt_at",
+          "type": "timestamptz(6)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": 6,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "datetime"
+        },
+        "published_at": {
+          "name": "published_at",
+          "type": "timestamptz(6)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": 6,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "datetime"
+        }
+      },
+      "name": "outbox_messages",
+      "schema": "public",
+      "indexes": [
+        {
+          "columnNames": [
+            "id"
+          ],
+          "composite": false,
+          "constraint": false,
+          "keyName": "outbox_messages_pkey",
+          "unique": true,
+          "primary": true
+        },
+        {
+          "columnNames": [
+            "published_at",
+            "next_attempt_at",
+            "occurred_at",
+            "id"
+          ],
+          "composite": true,
+          "constraint": false,
+          "keyName": "outbox_publication_idx",
+          "unique": false,
+          "primary": false
+        }
+      ],
+      "checks": [
+        {
+          "name": "outbox_attempts_non_negative",
+          "columnName": "attempts",
+          "definition": "CHECK ((attempts >= 0))",
+          "expression": "attempts >= 0"
+        }
+      ],
+      "foreignKeys": {},
+      "nativeEnums": {},
+      "comment": null
+    },
+    {
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": true,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "uuid"
+        },
         "provider_id": {
           "name": "provider_id",
           "type": "varchar(255)",
@@ -432,7 +602,7 @@
       "checks": [
         {
           "name": "wager_transactions_amount_valid",
-          "columnName": "amount",
+          "columnName": "kind",
           "definition": "CHECK ((((kind = 'LOSS'::text) AND (amount = (0)::numeric)) OR ((kind = 'WIN'::text) AND (amount >= (0)::numeric)) OR ((kind = ANY (ARRAY['OPENING'::text, 'BET'::text, 'REFUND'::text, 'ROLLBACK'::text])) AND (amount > (0)::numeric))))",
           "expression": "(kind = 'LOSS'::text) AND (amount = (0)) OR (kind = 'WIN'::text) AND (amount >= (0)) OR (kind = ANY (ARRAY['OPENING'::text, 'BET'::text, 'REFUND'::text, 'ROLLBACK'::text])) AND (amount > (0))"
         },
@@ -450,13 +620,13 @@
         },
         {
           "name": "wager_transactions_processed_reference_required",
-          "columnName": "status",
+          "columnName": "reference_transaction_id",
           "definition": "CHECK (((status <> 'PROCESSED'::text) OR (kind <> ALL (ARRAY['REFUND'::text, 'ROLLBACK'::text])) OR (reference_transaction_id IS NOT NULL)))",
           "expression": "(status <> 'PROCESSED'::text) OR (kind <> ALL (ARRAY['REFUND'::text, 'ROLLBACK'::text])) OR (reference_transaction_id IS NOT NULL)"
         },
         {
           "name": "wager_transactions_processing_result",
-          "columnName": "status",
+          "columnName": "processed_at",
           "definition": "CHECK ((((status = 'PROCESSED'::text) AND (processed_at IS NOT NULL) AND (result_balance IS NOT NULL) AND (failure_code IS NULL)) OR ((status = ANY (ARRAY['REJECTED'::text, 'FAILED'::text])) AND (processed_at IS NULL) AND (failure_code IS NOT NULL)) OR ((status = ANY (ARRAY['PENDING'::text, 'PENDING_REFERENCE'::text])) AND (processed_at IS NULL) AND (result_balance IS NULL) AND (failure_code IS NULL))))",
           "expression": "((status = 'PROCESSED'::text) AND (processed_at IS NOT NULL) AND (result_balance IS NOT NULL) AND (failure_code IS NULL)) OR ((status = ANY (ARRAY['REJECTED'::text, 'FAILED'::text])) AND (processed_at IS NULL) AND (failure_code IS NOT NULL)) OR ((status = ANY (ARRAY['PENDING'::text, 'PENDING_REFERENCE'::text])) AND (processed_at IS NULL) AND (result_balance IS NULL) AND (failure_code IS NULL))"
         },
@@ -710,13 +880,13 @@
         },
         {
           "name": "ledger_arithmetic_valid",
-          "columnName": "direction",
+          "columnName": "balance_before",
           "definition": "CHECK ((((direction = 'CREDIT'::text) AND (balance_after = (balance_before + amount))) OR ((direction = 'DEBIT'::text) AND (balance_after = (balance_before - amount)))))",
           "expression": "((direction = 'CREDIT'::text) AND (balance_after = (balance_before + amount))) OR ((direction = 'DEBIT'::text) AND (balance_after = (balance_before - amount)))"
         },
         {
           "name": "ledger_balances_valid",
-          "columnName": "balance_after",
+          "columnName": "balance_before",
           "definition": "CHECK (((balance_before >= (0)::numeric) AND (balance_before <= 999999999999999999.99) AND (balance_after >= (0)::numeric) AND (balance_after <= 999999999999999999.99)))",
           "expression": "balance_before >= (0) AND balance_before <= 999999999999999999.99) AND (balance_after >= (0) AND (balance_after <= 999999999999999999.99)"
         },

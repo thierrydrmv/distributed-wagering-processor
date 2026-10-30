@@ -16,6 +16,8 @@ import {
   LedgerDirection,
   WalletLedgerEntry,
 } from '../../src/domain/entities/wallet-ledger-entry';
+import { OutboxMessage } from 'src/application/outbox/outbox-message';
+import { WalletBalanceChanged } from 'src/application/events/wallet-balance-changed';
 async function captureFailure(action: () => Promise<unknown>): Promise<Error> {
   try {
     await action();
@@ -407,11 +409,44 @@ describe('Financial consistency at real commit', () => {
       createdAt: at,
     });
 
-    await uow.execute(async ({ wallets, transactions, ledger }) => {
+    const eventId = randomUUID();
+
+    const event = WalletBalanceChanged.from(wallet, entry, {
+      eventId,
+      correlationId: randomUUID(),
+      causationId: transactionId,
+      occurredAt: at,
+    });
+
+    await uow.execute(async ({ wallets, transactions, ledger, outbox }) => {
       await wallets.insert(wallet);
       await transactions.insert(transaction, initialBalance);
       await ledger.insert(entry);
+      await outbox.insert(OutboxMessage.enqueue(event));
     });
+
+    const storedEvent = await client.query<{
+      event_type: string;
+      payload: unknown;
+      attempts: number;
+      published_at: Date | null;
+    }>(
+      `
+    select event_type, payload, attempts, published_at
+    from outbox_messages
+    where id = $1
+  `,
+      [eventId],
+    );
+
+    expect(storedEvent.rows).toEqual([
+      {
+        event_type: 'WalletBalanceChanged',
+        payload: event.toJSON(),
+        attempts: 0,
+        published_at: null,
+      },
+    ]);
 
     const persisted = await client.query<{
       balance: string;
