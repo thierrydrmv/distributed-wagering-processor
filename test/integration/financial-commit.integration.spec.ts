@@ -8,7 +8,14 @@ import ormConfig from '../../src/infrastructure/database/mikro-orm.config';
 import { Wallet } from '../../src/domain/entities/wallet';
 import { Money } from '../../src/domain/value-objects/money';
 import { MikroOrmFinancialUnitOfWork } from '../../src/infrastructure/database/mikro-orm-financial-unit-of-work';
-
+import {
+  WagerTransaction,
+  WagerTransactionKind,
+} from '../../src/domain/entities/wager-transaction';
+import {
+  LedgerDirection,
+  WalletLedgerEntry,
+} from '../../src/domain/entities/wallet-ledger-entry';
 async function captureFailure(action: () => Promise<unknown>): Promise<Error> {
   try {
     await action();
@@ -350,5 +357,115 @@ describe('Financial consistency at real commit', () => {
     );
 
     expect(persisted.rows[0]?.count).toBe('0');
+  });
+  test('unit of work commits wallet, transaction and ledger together', async () => {
+    const uow = new MikroOrmFinancialUnitOfWork(applicationOrm);
+
+    const walletId = randomUUID();
+    const transactionId = randomUUID();
+    const entryId = randomUUID();
+    const playerId = randomUUID();
+    const at = new Date();
+
+    const initialBalance = Money.from({
+      amount: '100.00',
+      currency: 'BRL',
+    });
+
+    const wallet = Wallet.open({
+      id: walletId,
+      playerId,
+      initialBalance,
+      at,
+    });
+
+    const transaction = WagerTransaction.create({
+      id: transactionId,
+      providerId: 'internal',
+      externalTransactionId: `opening:${walletId}`,
+      idempotencyKey: `internal:opening:${walletId}`,
+      payloadHash: 'a'.repeat(64),
+      walletId,
+      playerId,
+      roundId: `opening:${walletId}`,
+      gameId: 'internal',
+      kind: WagerTransactionKind.Opening,
+      money: initialBalance,
+      createdAt: at,
+    });
+
+    transaction.markProcessed(undefined, at);
+
+    const entry = WalletLedgerEntry.create({
+      id: entryId,
+      walletId,
+      transactionId,
+      direction: LedgerDirection.Credit,
+      money: initialBalance,
+      balanceBefore: Money.zero('BRL'),
+      balanceAfter: initialBalance,
+      createdAt: at,
+    });
+
+    await uow.execute(async ({ wallets, transactions, ledger }) => {
+      await wallets.insert(wallet);
+      await transactions.insert(transaction, initialBalance);
+      await ledger.insert(entry);
+    });
+
+    const persisted = await client.query<{
+      balance: string;
+      version: number;
+      status: string;
+      result_balance: string;
+      amount: string;
+    }>(
+      `
+      select
+        w.balance,
+        w.version,
+        t.status,
+        t.result_balance,
+        l.amount
+      from wallets w
+      join wager_transactions t on t.wallet_id = w.id
+      join wallet_ledger_entries l on l.transaction_id = t.id
+      where
+        w.id = $1
+        and t.id = $2
+        and l.id = $3
+    `,
+      [walletId, transactionId, entryId],
+    );
+
+    expect(persisted.rows).toEqual([
+      {
+        balance: '100.00',
+        version: 1,
+        status: 'PROCESSED',
+        result_balance: '100.00',
+        amount: '100.00',
+      },
+    ]);
+
+    const restored = await uow.execute(async ({ wallets, transactions }) => {
+      const loadedWallet = await wallets.findByIdForUpdate(walletId);
+
+      const loadedTransaction = await transactions.findByIdempotencyKey(
+        transaction.idempotencyKey,
+      );
+
+      return {
+        balance: loadedWallet?.balance.toJSON().amount,
+        resultBalance: loadedTransaction?.resultBalance?.toJSON().amount,
+        transactionId: loadedTransaction?.transaction.id,
+      };
+    });
+
+    expect(restored).toEqual({
+      balance: '100.00',
+      resultBalance: '100.00',
+      transactionId,
+    });
   });
 });
