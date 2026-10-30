@@ -18,6 +18,7 @@ import {
 } from '../../src/domain/entities/wallet-ledger-entry';
 import { OutboxMessage } from 'src/application/outbox/outbox-message';
 import { WalletBalanceChanged } from 'src/application/events/wallet-balance-changed';
+import { OpenWallet } from 'src/application/use-cases/open-wallet';
 async function captureFailure(action: () => Promise<unknown>): Promise<Error> {
   try {
     await action();
@@ -360,6 +361,7 @@ describe('Financial consistency at real commit', () => {
 
     expect(persisted.rows[0]?.count).toBe('0');
   });
+
   test('unit of work commits wallet, transaction and ledger together', async () => {
     const uow = new MikroOrmFinancialUnitOfWork(applicationOrm);
 
@@ -502,5 +504,203 @@ describe('Financial consistency at real commit', () => {
       resultBalance: '100.00',
       transactionId,
     });
+  });
+
+  test('OpenWallet persists opening, ledger and events atomically', async () => {
+    const useCase = new OpenWallet(
+      new MikroOrmFinancialUnitOfWork(applicationOrm),
+    );
+
+    const playerId = randomUUID();
+    const correlationId = randomUUID();
+
+    const result = await useCase.execute({
+      playerId,
+      initialBalance: { amount: '100.00', currency: 'GBP' },
+      correlationId,
+    });
+
+    expect(result.id).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+    );
+
+    expect(result).toEqual({
+      id: result.id,
+      playerId,
+      balance: { amount: '100.00', currency: 'GBP' },
+      version: 1,
+    });
+
+    const financialRecords = await client.query<{
+      kind: string;
+      status: string;
+      amount: string;
+      balance_before: string;
+      balance_after: string;
+    }>(
+      `
+      select
+        t.kind,
+        t.status,
+        l.amount,
+        l.balance_before,
+        l.balance_after
+      from wager_transactions t
+      join wallet_ledger_entries l on l.transaction_id = t.id
+      where t.wallet_id = $1
+    `,
+      [result.id],
+    );
+
+    expect(financialRecords.rows).toEqual([
+      {
+        kind: 'OPENING',
+        status: 'PROCESSED',
+        amount: '100.00',
+        balance_before: '0.00',
+        balance_after: '100.00',
+      },
+    ]);
+
+    const events = await client.query<{
+      event_type: string;
+      correlation_id: string;
+      published_at: Date | null;
+    }>(
+      `
+      select
+        event_type,
+        payload->>'correlationId' as correlation_id,
+        published_at
+      from outbox_messages
+      where aggregate_id = $1
+      order by event_type
+    `,
+      [result.id],
+    );
+
+    expect(events.rows).toEqual([
+      {
+        event_type: 'WagerTransactionProcessed',
+        correlation_id: correlationId,
+        published_at: null,
+      },
+      {
+        event_type: 'WalletBalanceChanged',
+        correlation_id: correlationId,
+        published_at: null,
+      },
+    ]);
+  });
+
+  test('OpenWallet creates a zero-balance wallet without financial entries', async () => {
+    const useCase = new OpenWallet(
+      new MikroOrmFinancialUnitOfWork(applicationOrm),
+    );
+
+    const result = await useCase.execute({
+      playerId: randomUUID(),
+      initialBalance: { amount: '0.00', currency: 'BRL' },
+    });
+
+    const counts = await client.query<{
+      transactions: string;
+      entries: string;
+      events: string;
+    }>(
+      `
+      select
+        (
+          select count(*)
+          from wager_transactions
+          where wallet_id = $1::uuid
+        ) as transactions,
+        (
+          select count(*)
+          from wallet_ledger_entries
+          where wallet_id = $1::uuid
+        ) as entries,
+        (
+          select count(*)
+          from outbox_messages
+          where aggregate_id = $1::uuid
+        ) as events
+    `,
+      [result.id],
+    );
+
+    expect(result.version).toBe(1);
+    expect(result.balance.amount).toBe('0.00');
+
+    expect(counts.rows).toEqual([
+      { transactions: '0', entries: '0', events: '0' },
+    ]);
+  });
+
+  test('OpenWallet prevents concurrent duplicate wallets', async () => {
+    const useCase = new OpenWallet(
+      new MikroOrmFinancialUnitOfWork(applicationOrm),
+    );
+
+    const playerId = randomUUID();
+
+    const request = {
+      playerId,
+      initialBalance: { amount: '100.00', currency: 'BRL' },
+    };
+
+    const results = await Promise.allSettled([
+      useCase.execute(request),
+      useCase.execute(request),
+    ]);
+
+    expect(
+      results.filter((result) => result.status === 'fulfilled'),
+    ).toHaveLength(1);
+
+    expect(
+      results.filter((result) => result.status === 'rejected'),
+    ).toHaveLength(1);
+
+    const counts = await client.query<{
+      wallets: string;
+      openings: string;
+      entries: string;
+      events: string;
+    }>(
+      `
+      select
+        (
+          select count(*) from wallets
+          where player_id = $1
+        ) as wallets,
+        (
+          select count(*) from wager_transactions
+          where player_id = $1 and kind = 'OPENING'
+        ) as openings,
+        (
+          select count(*)
+          from wallet_ledger_entries l
+          join wallets w on w.id = l.wallet_id
+          where w.player_id = $1
+        ) as entries,
+        (
+          select count(*)
+          from outbox_messages o
+          join wallets w on w.id = o.aggregate_id
+          where w.player_id = $1
+        ) as events
+    `,
+      [playerId],
+    );
+
+    expect(counts.rows).toEqual([
+      {
+        wallets: '1',
+        openings: '1',
+        entries: '1',
+        events: '2',
+      },
+    ]);
   });
 });
