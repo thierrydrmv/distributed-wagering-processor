@@ -38,6 +38,7 @@ import {
   DeleteQueueCommand,
   ReceiveMessageCommand,
   SendMessageCommand,
+  ChangeMessageVisibilityCommand,
 } from '@aws-sdk/client-sqs';
 import { createSqsClient } from '../../src/infrastructure/messaging/sqs-client';
 import { SqsWagerConsumer } from '../../src/infrastructure/messaging/sqs-wager.consumer';
@@ -47,6 +48,8 @@ import { SqsEventPublisher } from '../../src/infrastructure/messaging/sqs-event.
 import { OutboxPublisherWorker } from '../../src/infrastructure/workers/outbox-publisher.worker';
 import { PersistenceConflictError } from '../../src/application/errors/wagering-error';
 import { startApplicationProcess } from '../helpers/application-process';
+import { spawn } from 'node:child_process';
+import { resolve } from 'node:path';
 
 async function captureFailure(action: () => Promise<unknown>): Promise<Error> {
   try {
@@ -171,6 +174,8 @@ describe('Financial consistency at real commit', () => {
       consumer,
       sourceUrl,
       dlqUrl,
+      transactionsQueue,
+      dlqQueue,
 
       dispose: async (): Promise<void> => {
         try {
@@ -217,6 +222,7 @@ describe('Financial consistency at real commit', () => {
     return {
       sqs,
       queueUrl,
+      queueName,
 
       createWorker: (batchSize = 5) => {
         const worker = new OutboxPublisherWorker(
@@ -2356,4 +2362,428 @@ describe('Financial consistency at real commit', () => {
 
     expect(await worker.runOnce()).toBe(0);
   });
+
+  test('redelivers after a consumer crashes between commit and acknowledgement', async () => {
+    const connectionString = process.env.TEST_DATABASE_URL;
+
+    if (!connectionString) {
+      throw new Error('TEST_DATABASE_URL is required');
+    }
+
+    const databaseUrl = new URL(connectionString);
+    databaseUrl.pathname = `/${databaseName}`;
+
+    const { processor, wallet, request, metrics } = await wageringFixture();
+
+    const fixture = await consumerFixture(processor, metrics);
+
+    try {
+      const input = request();
+
+      const body = JSON.stringify({
+        messageId: randomUUID(),
+        type: 'WagerTransactionRequested',
+        occurredAt: new Date().toISOString(),
+        data: input,
+      });
+
+      await fixture.sqs.send(
+        new SendMessageCommand({
+          QueueUrl: fixture.sourceUrl,
+          MessageBody: body,
+          MessageGroupId: wallet.id,
+          MessageDeduplicationId: randomUUID(),
+        }),
+      );
+
+      const child = spawn(
+        process.execPath,
+        [
+          resolve('test/helpers/crash-sqs-consumer.ts'),
+          fixture.transactionsQueue,
+          fixture.dlqQueue,
+        ],
+        {
+          cwd: process.cwd(),
+          env: {
+            ...process.env,
+            DATABASE_URL: databaseUrl.toString(),
+            REFERENCE_WORKER_ENABLED: 'false',
+            SQS_CONSUMER_ENABLED: 'false',
+            OUTBOX_PUBLISHER_ENABLED: 'false',
+          },
+          stdio: ['ignore', 'ignore', 'inherit'],
+        },
+      );
+
+      const exit = await new Promise<{
+        code: number | null;
+        signal: NodeJS.Signals | null;
+        timedOut: boolean;
+      }>((resolveExit, rejectExit) => {
+        let timedOut = false;
+
+        const timer = setTimeout(() => {
+          timedOut = true;
+          child.kill('SIGKILL');
+        }, 25_000);
+
+        child.once('error', (error) => {
+          clearTimeout(timer);
+          rejectExit(error);
+        });
+
+        child.once('close', (code, signal) => {
+          clearTimeout(timer);
+
+          resolveExit({
+            code,
+            signal,
+            timedOut,
+          });
+        });
+      });
+
+      expect(exit.timedOut).toBe(false);
+      expect(exit.signal).toBe('SIGKILL');
+
+      // Confirma que o commit aconteceu antes da queda.
+      const committed = await client.query<{
+        balance: string;
+        status: string;
+      }>(
+        `
+        select w.balance, t.status
+        from wallets w
+        join wager_transactions t
+          on t.wallet_id = w.id
+        where w.id = $1::uuid
+          and t.idempotency_key = $2
+      `,
+        [wallet.id, input.idempotencyKey],
+      );
+
+      expect(committed.rows).toEqual([
+        {
+          balance: '75.00',
+          status: 'PROCESSED',
+        },
+      ]);
+
+      // A variável abaixo mantém a tipagem específica
+      // da resposta de ReceiveMessage.
+      const receiveAgain = () =>
+        fixture.sqs.send(
+          new ReceiveMessageCommand({
+            QueueUrl: fixture.sourceUrl,
+            WaitTimeSeconds: 2,
+            VisibilityTimeout: 10,
+            MaxNumberOfMessages: 1,
+          }),
+        );
+
+      let delivery: Awaited<ReturnType<typeof receiveAgain>> | undefined;
+
+      const deadline = Date.now() + 45_000;
+
+      while (Date.now() < deadline) {
+        const result = await receiveAgain();
+
+        if (result.Messages?.length) {
+          delivery = result;
+          break;
+        }
+      }
+
+      expect(delivery?.Messages).toHaveLength(1);
+
+      const message = delivery?.Messages?.[0];
+
+      if (!message?.ReceiptHandle) {
+        throw new Error('Expected an unacknowledged message');
+      }
+
+      expect(message.Body).toBe(body);
+
+      // Devolve imediatamente a mensagem ao consumidor
+      // substituto, usando o receipt handle atual.
+      await fixture.sqs.send(
+        new ChangeMessageVisibilityCommand({
+          QueueUrl: fixture.sourceUrl,
+          ReceiptHandle: message.ReceiptHandle,
+          VisibilityTimeout: 0,
+        }),
+      );
+
+      expect(await fixture.consumer.runOnce(2)).toBe(1);
+
+      const stored = await client.query<{
+        balance: string;
+        version: number;
+        debits: string;
+      }>(
+        `
+        select
+          w.balance,
+          w.version,
+          (
+            select count(*)
+            from wallet_ledger_entries l
+            where l.wallet_id = w.id
+              and l.direction = 'DEBIT'
+          ) as debits
+        from wallets w
+        where w.id = $1::uuid
+      `,
+        [wallet.id],
+      );
+
+      expect(stored.rows).toEqual([
+        {
+          balance: '75.00',
+          version: 2,
+          debits: '1',
+        },
+      ]);
+
+      const replays = await metrics.idempotentReplays.get();
+
+      expect(replays.values).toEqual([
+        {
+          labels: { source: 'sqs' },
+          value: 1,
+        },
+      ]);
+
+      const remaining = await fixture.sqs.send(
+        new ReceiveMessageCommand({
+          QueueUrl: fixture.sourceUrl,
+          WaitTimeSeconds: 1,
+        }),
+      );
+
+      expect(remaining.Messages ?? []).toHaveLength(0);
+    } finally {
+      await fixture.dispose();
+    }
+  }, 90_000);
+
+  test('recovers after publication succeeds but the publisher crashes before marking the outbox', async () => {
+    const connectionString = process.env.TEST_DATABASE_URL;
+
+    if (!connectionString) {
+      throw new Error('TEST_DATABASE_URL is required');
+    }
+
+    const databaseUrl = new URL(connectionString);
+    databaseUrl.pathname = `/${databaseName}`;
+
+    const { wallet } = await wageringFixture();
+    const fixture = await outboxFixture(wallet.id);
+
+    try {
+      const child = spawn(
+        process.execPath,
+        [
+          resolve('test/helpers/crash-outbox-publisher.ts'),
+          wallet.id,
+          fixture.queueName,
+        ],
+        {
+          cwd: process.cwd(),
+          env: {
+            ...process.env,
+            DATABASE_URL: databaseUrl.toString(),
+            REFERENCE_WORKER_ENABLED: 'false',
+            SQS_CONSUMER_ENABLED: 'false',
+            OUTBOX_PUBLISHER_ENABLED: 'false',
+          },
+          stdio: ['ignore', 'ignore', 'inherit'],
+        },
+      );
+
+      const exit = await new Promise<{
+        signal: NodeJS.Signals | null;
+        timedOut: boolean;
+      }>((resolveExit, rejectExit) => {
+        let timedOut = false;
+
+        const timer = setTimeout(() => {
+          timedOut = true;
+          child.kill('SIGKILL');
+        }, 25_000);
+
+        child.once('error', (error) => {
+          clearTimeout(timer);
+          rejectExit(error);
+        });
+
+        child.once('close', (_code, signal) => {
+          clearTimeout(timer);
+
+          resolveExit({
+            signal,
+            timedOut,
+          });
+        });
+      });
+
+      expect(exit.timedOut).toBe(false);
+      expect(exit.signal).toBe('SIGKILL');
+
+      // O evento já chegou ao SQS.
+      const firstDelivery = await fixture.sqs.send(
+        new ReceiveMessageCommand({
+          QueueUrl: fixture.queueUrl,
+          WaitTimeSeconds: 2,
+          MaxNumberOfMessages: 1,
+        }),
+      );
+
+      expect(firstDelivery.Messages).toHaveLength(1);
+
+      const firstMessage = firstDelivery.Messages?.[0];
+
+      if (!firstMessage?.Body || !firstMessage.ReceiptHandle) {
+        throw new Error('Expected the event published before the crash');
+      }
+
+      const firstPayload: unknown = JSON.parse(firstMessage.Body);
+
+      if (
+        typeof firstPayload !== 'object' ||
+        firstPayload === null ||
+        !('eventId' in firstPayload) ||
+        typeof firstPayload.eventId !== 'string'
+      ) {
+        throw new Error('Invalid published event');
+      }
+
+      const firstEventId = firstPayload.eventId;
+
+      // Apesar do envio, a outbox ainda não foi marcada.
+      const interrupted = await client.query<{
+        published_at: Date | null;
+        claimed: boolean;
+      }>(
+        `
+        select
+          published_at,
+          claim_token is not null as claimed
+        from outbox_messages
+        where id = $1::uuid
+      `,
+        [firstEventId],
+      );
+
+      expect(interrupted.rows).toEqual([
+        {
+          published_at: null,
+          claimed: true,
+        },
+      ]);
+
+      await fixture.sqs.send(
+        new DeleteMessageCommand({
+          QueueUrl: fixture.queueUrl,
+          ReceiptHandle: firstMessage.ReceiptHandle,
+        }),
+      );
+
+      // Expira o lease no banco para evitar esperar 60 segundos.
+      await client.query(
+        `
+        update outbox_messages
+        set claimed_until = clock_timestamp() - interval '1 second'
+        where id = $1::uuid
+      `,
+        [firstEventId],
+      );
+
+      const replacement = fixture.createWorker();
+
+      // A abertura gerou dois eventos.
+      // Um será republicado e o outro publicado pela primeira vez.
+      expect(await replacement.runOnce()).toBe(2);
+
+      const stored = await client.query<{
+        id: string;
+        published: boolean;
+        released: boolean;
+      }>(
+        `
+        select
+          id,
+          published_at is not null as published,
+          claim_token is null
+            and claimed_until is null as released
+        from outbox_messages
+        where aggregate_id = $1::uuid
+      `,
+        [wallet.id],
+      );
+
+      expect(stored.rows).toHaveLength(2);
+
+      for (const row of stored.rows) {
+        expect(row.published).toBe(true);
+        expect(row.released).toBe(true);
+      }
+
+      expect(stored.rows.some((row) => row.id === firstEventId)).toBe(true);
+
+      // Dentro da janela FIFO, o reenvio com o mesmo
+      // MessageDeduplicationId não deve gerar outra entrega.
+      const secondDelivery = await fixture.sqs.send(
+        new ReceiveMessageCommand({
+          QueueUrl: fixture.queueUrl,
+          WaitTimeSeconds: 2,
+          MaxNumberOfMessages: 1,
+        }),
+      );
+
+      expect(secondDelivery.Messages).toHaveLength(1);
+
+      const secondMessage = secondDelivery.Messages?.[0];
+
+      if (!secondMessage?.Body || !secondMessage.ReceiptHandle) {
+        throw new Error('Expected the second outbox event');
+      }
+
+      const secondPayload: unknown = JSON.parse(secondMessage.Body);
+
+      if (
+        typeof secondPayload !== 'object' ||
+        secondPayload === null ||
+        !('eventId' in secondPayload) ||
+        typeof secondPayload.eventId !== 'string'
+      ) {
+        throw new Error('Invalid second event');
+      }
+
+      expect(secondPayload.eventId).not.toBe(firstEventId);
+
+      expect(stored.rows.some((row) => row.id === secondPayload.eventId)).toBe(
+        true,
+      );
+
+      await fixture.sqs.send(
+        new DeleteMessageCommand({
+          QueueUrl: fixture.queueUrl,
+          ReceiptHandle: secondMessage.ReceiptHandle,
+        }),
+      );
+
+      const remaining = await fixture.sqs.send(
+        new ReceiveMessageCommand({
+          QueueUrl: fixture.queueUrl,
+          WaitTimeSeconds: 1,
+        }),
+      );
+
+      expect(remaining.Messages ?? []).toHaveLength(0);
+    } finally {
+      await fixture.dispose();
+    }
+  }, 60_000);
 });
