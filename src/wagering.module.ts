@@ -11,11 +11,13 @@ import { ProviderAuthGuard } from './infrastructure/http/provider-auth.guard';
 import { ProvidersController } from './infrastructure/http/providers.controller';
 import { FinancialMetrics } from './infrastructure/observability/financial-metrics';
 import { WageringQueries } from './infrastructure/database/queries/wagering.queries';
+import { SqsWagerConsumer } from './infrastructure/messaging/sqs-wager.consumer';
 
 @Module({
   imports: [DatabaseModule],
   providers: [
     ProviderAuthGuard,
+    FinancialMetrics,
     {
       provide: OpenWallet,
       useFactory: (uow: FinancialUnitOfWork) => new OpenWallet(uow),
@@ -33,12 +35,17 @@ import { WageringQueries } from './infrastructure/database/queries/wagering.quer
         new ReferenceRetryWorker(orm, processor),
       inject: [MikroORM, ProcessWagerTransaction],
     },
-    FinancialMetrics,
     {
       provide: WageringQueries,
       useFactory: (orm: MikroORM, metrics: FinancialMetrics) =>
         new WageringQueries(orm, metrics),
       inject: [MikroORM, FinancialMetrics],
+    },
+    {
+      provide: SqsWagerConsumer,
+      useFactory: (processor: ProcessWagerTransaction) =>
+        new SqsWagerConsumer(processor),
+      inject: [ProcessWagerTransaction],
     },
   ],
   controllers: [WalletsController, WageringController, ProvidersController],

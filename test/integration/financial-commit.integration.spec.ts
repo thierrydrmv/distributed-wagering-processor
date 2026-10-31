@@ -33,6 +33,15 @@ import { ProviderAuthGuard } from '../../src/infrastructure/http/provider-auth.g
 import { configureHttp } from '../../src/infrastructure/http/configure-http';
 import { WageringQueries } from '../../src/infrastructure/database/queries/wagering.queries';
 import { FinancialMetrics } from '../../src/infrastructure/observability/financial-metrics';
+import {
+  CreateQueueCommand,
+  DeleteQueueCommand,
+  ReceiveMessageCommand,
+  SendMessageCommand,
+} from '@aws-sdk/client-sqs';
+import { createSqsClient } from '../../src/infrastructure/messaging/sqs-client';
+import { SqsWagerConsumer } from '../../src/infrastructure/messaging/sqs-wager.consumer';
+
 async function captureFailure(action: () => Promise<unknown>): Promise<Error> {
   try {
     await action();
@@ -91,6 +100,73 @@ describe('Financial consistency at real commit', () => {
       processor: new ProcessWagerTransaction(uow),
       wallet,
       request,
+    };
+  };
+
+  const consumerFixture = async (processor: ProcessWagerTransaction) => {
+    const endpoint = process.env.TEST_SQS_ENDPOINT;
+
+    if (!endpoint) {
+      throw new Error('TEST_SQS_ENDPOINT is required');
+    }
+
+    const sqs = createSqsClient(endpoint);
+    const suffix = randomUUID();
+
+    const transactionsQueue = `consumer-${suffix}.fifo`;
+    const dlqQueue = `consumer-dlq-${suffix}.fifo`;
+
+    const attributes = {
+      FifoQueue: 'true',
+      ContentBasedDeduplication: 'false',
+      VisibilityTimeout: '30',
+    };
+
+    const source = await sqs.send(
+      new CreateQueueCommand({
+        QueueName: transactionsQueue,
+        Attributes: attributes,
+      }),
+    );
+
+    const dlq = await sqs.send(
+      new CreateQueueCommand({
+        QueueName: dlqQueue,
+        Attributes: attributes,
+      }),
+    );
+
+    if (!source.QueueUrl || !dlq.QueueUrl) {
+      sqs.destroy();
+      throw new Error('Test queue URLs were not returned');
+    }
+
+    const sourceUrl = source.QueueUrl;
+    const dlqUrl = dlq.QueueUrl;
+
+    const consumer = new SqsWagerConsumer(processor, {
+      endpoint,
+      transactionsQueue,
+      dlqQueue,
+    });
+
+    return {
+      sqs,
+      consumer,
+      sourceUrl,
+      dlqUrl,
+
+      dispose: async (): Promise<void> => {
+        try {
+          await consumer.onModuleDestroy();
+
+          await sqs.send(new DeleteQueueCommand({ QueueUrl: sourceUrl }));
+
+          await sqs.send(new DeleteQueueCommand({ QueueUrl: dlqUrl }));
+        } finally {
+          sqs.destroy();
+        }
+      },
     };
   };
 
@@ -1379,4 +1455,128 @@ describe('Financial consistency at real commit', () => {
 
     expect(persisted.rows[0]?.count).toBe('0');
   });
+
+  test('SQS consumer commits one debit for duplicate business messages', async () => {
+    const { processor, wallet, request } = await wageringFixture();
+    const fixture = await consumerFixture(processor);
+
+    try {
+      const input = request();
+      const messageId = randomUUID();
+
+      const body = JSON.stringify({
+        messageId,
+        type: 'WagerTransactionRequested',
+        occurredAt: new Date().toISOString(),
+        data: input,
+      });
+
+      // IDs de transporte diferentes para não depender
+      // da deduplicação FIFO do broker.
+      for (let copy = 0; copy < 2; copy += 1) {
+        await fixture.sqs.send(
+          new SendMessageCommand({
+            QueueUrl: fixture.sourceUrl,
+            MessageBody: body,
+            MessageGroupId: wallet.id,
+            MessageDeduplicationId: randomUUID(),
+          }),
+        );
+      }
+
+      expect(await fixture.consumer.runOnce(2)).toBe(1);
+      expect(await fixture.consumer.runOnce(2)).toBe(1);
+
+      const stored = await client.query<{
+        balance: string;
+        debits: string;
+        inbox: string;
+      }>(
+        `
+        select
+          w.balance,
+          (
+            select count(*)
+            from wallet_ledger_entries
+            where wallet_id = w.id and direction = 'DEBIT'
+          ) as debits,
+          (
+            select count(*)
+            from inbox_messages
+            where
+              consumer_name = 'wager-transactions-v1'
+              and message_id = $2
+              and processed_at is not null
+          ) as inbox
+        from wallets w
+        where w.id = $1
+      `,
+        [wallet.id, messageId],
+      );
+
+      expect(stored.rows).toEqual([
+        {
+          balance: '75.00',
+          debits: '1',
+          inbox: '1',
+        },
+      ]);
+
+      const remaining = await fixture.sqs.send(
+        new ReceiveMessageCommand({
+          QueueUrl: fixture.sourceUrl,
+          WaitTimeSeconds: 1,
+        }),
+      );
+
+      expect(remaining.Messages ?? []).toHaveLength(0);
+    } finally {
+      await fixture.dispose();
+    }
+  }, 20_000);
+
+  test('SQS consumer moves invalid envelopes to the DLQ', async () => {
+    const { processor } = await wageringFixture();
+    const fixture = await consumerFixture(processor);
+
+    try {
+      const body = JSON.stringify({ invalid: true });
+
+      await fixture.sqs.send(
+        new SendMessageCommand({
+          QueueUrl: fixture.sourceUrl,
+          MessageBody: body,
+          MessageGroupId: 'invalid-message',
+          MessageDeduplicationId: randomUUID(),
+        }),
+      );
+
+      expect(await fixture.consumer.runOnce(2)).toBe(1);
+
+      const dlq = await fixture.sqs.send(
+        new ReceiveMessageCommand({
+          QueueUrl: fixture.dlqUrl,
+          WaitTimeSeconds: 2,
+          MessageAttributeNames: ['All'],
+        }),
+      );
+
+      expect(dlq.Messages).toHaveLength(1);
+      expect(dlq.Messages?.[0]?.Body).toBe(body);
+      expect(
+        dlq.Messages?.[0]?.MessageAttributes?.failureCode?.StringValue,
+      ).toBe('INVALID_MESSAGE');
+
+      const remaining = await fixture.sqs.send(
+        new ReceiveMessageCommand({
+          QueueUrl: fixture.sourceUrl,
+          WaitTimeSeconds: 1,
+        }),
+      );
+
+      expect(remaining.Messages ?? []).toHaveLength(0);
+    } finally {
+      await fixture.dispose();
+    }
+  }, 20_000);
 });
