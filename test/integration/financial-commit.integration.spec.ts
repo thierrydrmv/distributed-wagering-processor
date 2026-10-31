@@ -41,6 +41,10 @@ import {
 } from '@aws-sdk/client-sqs';
 import { createSqsClient } from '../../src/infrastructure/messaging/sqs-client';
 import { SqsWagerConsumer } from '../../src/infrastructure/messaging/sqs-wager.consumer';
+import { DeleteMessageCommand } from '@aws-sdk/client-sqs';
+import type { EventPublisher } from '../../src/application/ports/event-publisher';
+import { SqsEventPublisher } from '../../src/infrastructure/messaging/sqs-event.publisher';
+import { OutboxPublisherWorker } from '../../src/infrastructure/workers/outbox-publisher.worker';
 
 async function captureFailure(action: () => Promise<unknown>): Promise<Error> {
   try {
@@ -163,6 +167,61 @@ describe('Financial consistency at real commit', () => {
           await sqs.send(new DeleteQueueCommand({ QueueUrl: sourceUrl }));
 
           await sqs.send(new DeleteQueueCommand({ QueueUrl: dlqUrl }));
+        } finally {
+          sqs.destroy();
+        }
+      },
+    };
+  };
+
+  const outboxFixture = async (aggregateId: string) => {
+    const endpoint = process.env.TEST_SQS_ENDPOINT;
+
+    if (!endpoint) {
+      throw new Error('TEST_SQS_ENDPOINT is required');
+    }
+
+    const sqs = createSqsClient(endpoint);
+    const queueName = `outbox-test-${randomUUID()}.fifo`;
+
+    const queue = await sqs.send(
+      new CreateQueueCommand({
+        QueueName: queueName,
+        Attributes: {
+          FifoQueue: 'true',
+          ContentBasedDeduplication: 'false',
+        },
+      }),
+    );
+
+    if (!queue.QueueUrl) {
+      sqs.destroy();
+      throw new Error('Outbox test queue URL was not returned');
+    }
+
+    const queueUrl = queue.QueueUrl;
+    const workers: OutboxPublisherWorker[] = [];
+
+    return {
+      sqs,
+      queueUrl,
+
+      createWorker: (batchSize = 5) => {
+        const worker = new OutboxPublisherWorker(
+          applicationOrm,
+          new SqsEventPublisher({ endpoint, queueName }),
+          { aggregateId, batchSize },
+        );
+
+        workers.push(worker);
+        return worker;
+      },
+
+      dispose: async (): Promise<void> => {
+        try {
+          await Promise.all(workers.map((worker) => worker.onModuleDestroy()));
+
+          await sqs.send(new DeleteQueueCommand({ QueueUrl: queueUrl }));
         } finally {
           sqs.destroy();
         }
@@ -1579,4 +1638,190 @@ describe('Financial consistency at real commit', () => {
       await fixture.dispose();
     }
   }, 20_000);
+
+  test('two outbox publishers publish all committed events', async () => {
+    const uow = new MikroOrmFinancialUnitOfWork(applicationOrm);
+
+    const wallet = await new OpenWallet(uow).execute({
+      playerId: randomUUID(),
+      initialBalance: { amount: '100.00', currency: 'BRL' },
+    });
+
+    const fixture = await outboxFixture(wallet.id);
+
+    try {
+      const first = fixture.createWorker(1);
+      const second = fixture.createWorker(1);
+
+      const counts = await Promise.all([first.runOnce(), second.runOnce()]);
+
+      expect(counts.reduce((sum, count) => sum + count, 0)).toBe(2);
+
+      const stored = await client.query<{
+        id: string;
+        published: boolean;
+      }>(
+        `
+        select id, published_at is not null as published
+        from outbox_messages
+        where aggregate_id = $1
+        order by id
+      `,
+        [wallet.id],
+      );
+
+      expect(stored.rows).toHaveLength(2);
+      expect(stored.rows.every((row) => row.published)).toBe(true);
+
+      const receivedIds: string[] = [];
+
+      for (
+        let attempt = 0;
+        attempt < 3 && receivedIds.length < 2;
+        attempt += 1
+      ) {
+        const received = await fixture.sqs.send(
+          new ReceiveMessageCommand({
+            QueueUrl: fixture.queueUrl,
+            MaxNumberOfMessages: 10,
+            WaitTimeSeconds: 2,
+          }),
+        );
+
+        for (const message of received.Messages ?? []) {
+          if (!message.Body || !message.ReceiptHandle) {
+            throw new Error('Incomplete published message');
+          }
+
+          const event: unknown = JSON.parse(message.Body);
+
+          if (
+            typeof event !== 'object' ||
+            event === null ||
+            !('eventId' in event) ||
+            typeof event.eventId !== 'string'
+          ) {
+            throw new Error('Invalid integration event');
+          }
+
+          receivedIds.push(event.eventId);
+
+          expect(event).toMatchObject({
+            aggregateId: wallet.id,
+            version: 1,
+          });
+
+          await fixture.sqs.send(
+            new DeleteMessageCommand({
+              QueueUrl: fixture.queueUrl,
+              ReceiptHandle: message.ReceiptHandle,
+            }),
+          );
+        }
+      }
+
+      expect(receivedIds.sort()).toEqual(
+        stored.rows.map((row) => row.id).sort(),
+      );
+    } finally {
+      await fixture.dispose();
+    }
+  }, 30_000);
+
+  test('outbox publisher recovers an expired claim after restart', async () => {
+    const uow = new MikroOrmFinancialUnitOfWork(applicationOrm);
+
+    const wallet = await new OpenWallet(uow).execute({
+      playerId: randomUUID(),
+      initialBalance: { amount: '100.00', currency: 'BRL' },
+    });
+
+    // Representa um publisher que morreu com o trabalho reservado.
+    await client.query(
+      `
+      update outbox_messages
+      set
+        claim_token = $2::uuid,
+        claimed_until = now() - interval '1 second'
+      where aggregate_id = $1::uuid
+    `,
+      [wallet.id, randomUUID()],
+    );
+
+    const fixture = await outboxFixture(wallet.id);
+
+    try {
+      const replacement = fixture.createWorker();
+
+      expect(await replacement.runOnce()).toBe(2);
+
+      const pending = await client.query<{ count: string }>(
+        `
+        select count(*) as count
+        from outbox_messages
+        where aggregate_id = $1 and published_at is null
+      `,
+        [wallet.id],
+      );
+
+      expect(pending.rows[0]?.count).toBe('0');
+    } finally {
+      await fixture.dispose();
+    }
+  }, 30_000);
+
+  test('outbox retains events and persists retry after transport failure', async () => {
+    const uow = new MikroOrmFinancialUnitOfWork(applicationOrm);
+
+    const wallet = await new OpenWallet(uow).execute({
+      playerId: randomUUID(),
+      initialBalance: { amount: '100.00', currency: 'BRL' },
+    });
+
+    const unavailablePublisher: EventPublisher = {
+      publish: () => Promise.reject(new Error('Simulated SQS unavailability')),
+      close: () => undefined,
+    };
+
+    const worker = new OutboxPublisherWorker(
+      applicationOrm,
+      unavailablePublisher,
+      { aggregateId: wallet.id },
+    );
+
+    try {
+      expect(await worker.runOnce()).toBe(0);
+
+      const stored = await client.query<{
+        attempts: number;
+        pending: boolean;
+        scheduled: boolean;
+        released: boolean;
+      }>(
+        `
+        select
+          attempts,
+          published_at is null as pending,
+          next_attempt_at is not null as scheduled,
+          claim_token is null as released
+        from outbox_messages
+        where aggregate_id = $1
+      `,
+        [wallet.id],
+      );
+
+      expect(stored.rows).toHaveLength(2);
+
+      for (const row of stored.rows) {
+        expect(row).toEqual({
+          attempts: 1,
+          pending: true,
+          scheduled: true,
+          released: true,
+        });
+      }
+    } finally {
+      await worker.onModuleDestroy();
+    }
+  });
 });

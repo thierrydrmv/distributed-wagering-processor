@@ -18,6 +18,8 @@ export class MikroOrmOutboxRepository implements OutboxRepository {
       attempts: state.attempts,
       nextAttemptAt: state.nextAttemptAt ?? null,
       publishedAt: state.publishedAt ?? null,
+      claimToken: null,
+      claimedUntil: null,
     });
   }
 }

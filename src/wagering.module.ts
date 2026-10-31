@@ -12,6 +12,9 @@ import { ProvidersController } from './infrastructure/http/providers.controller'
 import { FinancialMetrics } from './infrastructure/observability/financial-metrics';
 import { WageringQueries } from './infrastructure/database/queries/wagering.queries';
 import { SqsWagerConsumer } from './infrastructure/messaging/sqs-wager.consumer';
+import { EventPublisher } from './application/ports/event-publisher';
+import { SqsEventPublisher } from './infrastructure/messaging/sqs-event.publisher';
+import { OutboxPublisherWorker } from './infrastructure/workers/outbox-publisher.worker';
 
 @Module({
   imports: [DatabaseModule],
@@ -46,6 +49,16 @@ import { SqsWagerConsumer } from './infrastructure/messaging/sqs-wager.consumer'
       useFactory: (processor: ProcessWagerTransaction) =>
         new SqsWagerConsumer(processor),
       inject: [ProcessWagerTransaction],
+    },
+    {
+      provide: EventPublisher,
+      useFactory: () => new SqsEventPublisher(),
+    },
+    {
+      provide: OutboxPublisherWorker,
+      useFactory: (orm: MikroORM, publisher: EventPublisher) =>
+        new OutboxPublisherWorker(orm, publisher),
+      inject: [MikroORM, EventPublisher],
     },
   ],
   controllers: [WalletsController, WageringController, ProvidersController],

@@ -10,6 +10,8 @@ export class OutboxMessageRecord {
   attempts!: number;
   nextAttemptAt!: Date | null;
   publishedAt!: Date | null;
+  claimToken!: string | null;
+  claimedUntil!: Date | null;
 }
 
 export const OutboxMessageSchema = new EntitySchema<OutboxMessageRecord>({
@@ -52,6 +54,17 @@ export const OutboxMessageSchema = new EntitySchema<OutboxMessageRecord>({
       type: 'Date',
       columnType: 'timestamptz',
       fieldName: 'published_at',
+      nullable: true,
+    },
+    claimToken: {
+      type: 'uuid',
+      fieldName: 'claim_token',
+      nullable: true,
+    },
+    claimedUntil: {
+      type: 'Date',
+      columnType: 'timestamptz',
+      fieldName: 'claimed_until',
       nullable: true,
     },
   },
