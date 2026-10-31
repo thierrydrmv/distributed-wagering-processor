@@ -1,98 +1,319 @@
-<p align="center">
-  <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /></a>
-</p>
+# Distributed Wagering Processor
 
-[circleci-image]: https://img.shields.io/circleci/build/github/nestjs/nest/master?token=abc123def456
-[circleci-url]: https://circleci.com/gh/nestjs/nest
+Processador distribuído de transações de apostas com NestJS, PostgreSQL,
+MikroORM e SQS FIFO.
 
-  <p align="center">A progressive <a href="http://nodejs.org" target="_blank">Node.js</a> framework for building efficient and scalable server-side applications.</p>
-    <p align="center">
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/v/@nestjs/core.svg" alt="NPM Version" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/l/@nestjs/core.svg" alt="Package License" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/dm/@nestjs/common.svg" alt="NPM Downloads" /></a>
-<a href="https://circleci.com/gh/nestjs/nest" target="_blank"><img src="https://img.shields.io/circleci/build/github/nestjs/nest/master" alt="CircleCI" /></a>
-<a href="https://discord.gg/G7Qnnhy" target="_blank"><img src="https://img.shields.io/badge/discord-online-brightgreen.svg" alt="Discord"/></a>
-<a href="https://opencollective.com/nest#backer" target="_blank"><img src="https://opencollective.com/nest/backers/badge.svg" alt="Backers on Open Collective" /></a>
-<a href="https://opencollective.com/nest#sponsor" target="_blank"><img src="https://opencollective.com/nest/sponsors/badge.svg" alt="Sponsors on Open Collective" /></a>
-  <a href="https://paypal.me/kamilmysliwiec" target="_blank"><img src="https://img.shields.io/badge/Donate-PayPal-ff3f59.svg" alt="Donate us"/></a>
-    <a href="https://opencollective.com/nest#sponsor"  target="_blank"><img src="https://img.shields.io/badge/Support%20us-Open%20Collective-41B883.svg" alt="Support us"></a>
-  <a href="https://twitter.com/nestframework" target="_blank"><img src="https://img.shields.io/twitter/follow/nestframework.svg?style=social&label=Follow" alt="Follow us on Twitter"></a>
-</p>
-  <!--[![Backers on Open Collective](https://opencollective.com/nest/backers/badge.svg)](https://opencollective.com/nest#backer)
-  [![Sponsors on Open Collective](https://opencollective.com/nest/sponsors/badge.svg)](https://opencollective.com/nest#sponsor)-->
+O projeto utiliza Bun, valores monetários representados por strings,
+ledger imutável, inbox para deduplicação de mensagens e transactional outbox.
 
-## Description
+## Requisitos
 
-[Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
+- Docker com Docker Compose v2.
+- Bun 1.4.4 para desenvolvimento e testes locais.
 
-## Project setup
+O ambiente Docker inicia três réplicas da aplicação atrás de um Nginx.
+
+## Executar com Docker
 
 ```bash
-$ bun install
+cp .env.example .env
+docker compose up -d --build
+docker compose ps -a
 ```
 
-## Compile and run the project
+Na inicialização:
+
+1. PostgreSQL e LocalStack ficam disponíveis.
+2. O serviço `migrate` aplica as migrations.
+3. O serviço `setup-queues` cria as filas.
+4. Três réplicas da aplicação iniciam.
+5. O gateway disponibiliza a API em `http://localhost:3000`.
+
+Os serviços `migrate` e `setup-queues` devem terminar com código zero.
 
 ```bash
-# development
-$ bun run start
-
-# watch mode
-$ bun run start:dev
-
-# production mode
-$ bun run start:prod
+curl -i http://localhost:3000/health/live
+curl -i http://localhost:3000/health/ready
 ```
 
-## Run tests
+Para consultar logs:
 
 ```bash
-# unit tests
-$ bun run test
-
-# e2e tests
-$ bun run test:e2e
-
-# test coverage
-$ bun run test:cov
+docker compose logs --tail=100 app
+docker compose logs migrate setup-queues
 ```
 
-## Deployment
-
-When you're ready to deploy your NestJS application to production, there are some key steps you can take to ensure it runs as efficiently as possible. Check out the [deployment documentation](https://docs.nestjs.com/deployment) for more information.
-
-If you are looking for a cloud-based platform to deploy your NestJS application, check out [Mau](https://mau.nestjs.com), our official platform for deploying NestJS applications on AWS. Mau makes deployment straightforward and fast, requiring just a few simple steps:
+Para encerrar sem remover o volume PostgreSQL:
 
 ```bash
-$ bun install -g @nestjs/mau
-$ mau deploy
+docker compose down
 ```
 
-With Mau, you can deploy your application in just a few clicks, allowing you to focus on building features rather than managing infrastructure.
+O LocalStack deste ambiente não tem persistência configurada. As filas são
+recriadas no bootstrap, mas suas mensagens podem ser perdidas ao recriar
+o container.
 
-## Resources
+Após recriar ou alterar a quantidade de réplicas, reinicie o gateway:
 
-Check out a few resources that may come in handy when working with NestJS:
+```bash
+docker compose restart gateway
+```
 
-- Visit the [NestJS Documentation](https://docs.nestjs.com) to learn more about the framework.
-- For questions and support, please visit our [Discord channel](https://discord.gg/G7Qnnhy).
-- To dive deeper and get more hands-on experience, check out our official video [courses](https://courses.nestjs.com/).
-- Deploy your application to AWS with the help of [NestJS Mau](https://mau.nestjs.com) in just a few clicks.
-- Visualize your application graph and interact with the NestJS application in real-time using [NestJS Devtools](https://devtools.nestjs.com).
-- Need help with your project (part-time to full-time)? Check out our official [enterprise support](https://enterprise.nestjs.com).
-- To stay in the loop and get updates, follow us on [X](https://x.com/nestframework) and [LinkedIn](https://linkedin.com/company/nestjs).
-- Looking for a job, or have a job to offer? Check out our official [Jobs board](https://jobs.nestjs.com).
+## Desenvolvimento local
 
-## Support
+```bash
+bun install --frozen-lockfile
+docker compose up -d postgres localstack
+bun run migration:up
+bun run queues:setup
+bun run build
+bun run start:prod
+```
 
-Nest is an MIT-licensed open source project. It can grow thanks to the sponsors and support by the amazing backers. If you'd like to join them, please [read more here](https://docs.nestjs.com/support).
+Pare o gateway antes de iniciar a aplicação local na mesma porta:
 
-## Stay in touch
+```bash
+docker compose stop gateway
+```
 
-- Author - [Kamil Myśliwiec](https://twitter.com/kammysliwiec)
-- Website - [https://nestjs.com](https://nestjs.com/)
-- Twitter - [@nestframework](https://twitter.com/nestframework)
+A aplicação compilada é executada para preservar os metadados dos decorators
+emitidos pelo TypeScript.
 
-## License
+As URLs do `.env` apontam para os serviços publicados no host. No Compose,
+as URLs são substituídas pelos endereços internos `postgres` e `localstack`.
 
-Nest is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
+## Testes
+
+Crie o banco de administração dos testes uma vez, usando as credenciais
+locais do exemplo:
+
+```bash
+docker compose exec postgres psql -U wagering -d postgres \
+  -c 'CREATE DATABASE wagering_test;'
+```
+
+Se o banco já existir, não é necessário recriá-lo.
+
+```bash
+bun run build
+bun run test
+bun run test:integration
+```
+
+O build deve anteceder os testes de integração porque os testes com
+múltiplos processos executam `dist/main.js`.
+
+A integração utiliza PostgreSQL e LocalStack reais. As suites criam bancos
+e filas temporários. O usuário PostgreSQL dos testes precisa de permissão
+para criar bancos.
+
+`TEST_DATABASE_URL` deve apontar para `wagering_test`, nunca para o banco
+da aplicação.
+
+A cobertura inclui:
+
+- Precisão monetária e regras de domínio.
+- Constraints, triggers e imutabilidade do ledger.
+- Atomicidade das alterações financeiras e da outbox.
+- Idempotência e concorrência.
+- Referências recebidas fora de ordem.
+- Consumo SQS, inbox e encaminhamento para DLQ.
+- Recuperação de claims da outbox.
+- Métricas de processamento.
+- Requisições concorrentes entre três processos.
+- Recuperação após queda abrupta.
+- Queda entre commit financeiro e ACK.
+- Queda entre envio de evento e confirmação na outbox.
+
+Alguns testes injetam falhas e geram logs de erro esperados.
+
+## API
+
+| Método | Endpoint                                                              | Finalidade                           |
+| ------ | --------------------------------------------------------------------- | ------------------------------------ |
+| POST   | `/wallets`                                                            | Abrir carteira                       |
+| GET    | `/wallets/:walletId`                                                  | Consultar carteira                   |
+| POST   | `/wagering/transactions`                                              | Processar transação                  |
+| GET    | `/wagering/transactions/:transactionId`                               | Consultar transação                  |
+| GET    | `/providers/:providerId/wagering/transactions/:externalTransactionId` | Consultar pelo identificador externo |
+| GET    | `/wallets/:walletId/ledger`                                           | Consultar lançamentos paginados      |
+| POST   | `/wallets/:walletId/reconciliation`                                   | Comparar saldo e ledger              |
+| GET    | `/health/live`                                                        | Verificar processo                   |
+| GET    | `/health/ready`                                                       | Verificar PostgreSQL e filas         |
+| GET    | `/metrics`                                                            | Expor métricas Prometheus            |
+
+### Abrir carteira
+
+```bash
+curl -i -X POST http://localhost:3000/wallets \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "playerId": "11111111-1111-4111-8111-111111111111",
+    "initialBalance": {
+      "amount": "100.00",
+      "currency": "BRL"
+    }
+  }'
+```
+
+Utilize o `id` retornado como `walletId` nas próximas operações.
+
+### Processar uma aposta
+
+Substitua `WALLET_ID` pelo identificador retornado:
+
+```bash
+curl -i -X POST http://localhost:3000/wagering/transactions \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: provider-demo:bet-001' \
+  -H 'X-Correlation-Id: demo-bet-001' \
+  -d '{
+    "providerId": "provider-demo",
+    "externalTransactionId": "bet-001",
+    "playerId": "11111111-1111-4111-8111-111111111111",
+    "walletId": "WALLET_ID",
+    "roundId": "round-001",
+    "gameId": "game-001",
+    "kind": "BET",
+    "money": {
+      "amount": "25.00",
+      "currency": "BRL"
+    }
+  }'
+```
+
+Repita a mesma requisição e a mesma chave para obter um replay sem
+outro débito. Reutilizar a chave com outro conteúdo gera conflito.
+
+A unicidade de `(providerId, externalTransactionId)` também é protegida:
+reenviar a mesma identidade externa com outra chave gera conflito.
+
+Respostas de processamento:
+
+- `200`: transação processada.
+- `202`: aguardando referência.
+- `422`: rejeição de negócio.
+- `409`: conflito de identidade ou idempotência.
+
+O replay devolve o resultado persistido da transação, incluindo seu saldo
+original, e não o saldo atual da carteira.
+
+### Valores e operações
+
+Moedas suportadas: `BRL`, `USD`, `EUR` e `GBP`.
+
+Valores monetários devem ser strings com exatamente duas casas decimais.
+O máximo suportado é `999999999999999999.99`.
+
+Operações externas:
+
+| Operação | Efeito                                  |
+| -------- | --------------------------------------- |
+| BET      | Débito                                  |
+| WIN      | Crédito; zero é permitido               |
+| LOSS     | Valor zero, sem movimento financeiro    |
+| REFUND   | Reversão integral de BET                |
+| ROLLBACK | Reversão integral de BET, WIN ou REFUND |
+
+REFUND e ROLLBACK exigem `referenceExternalTransactionId`.
+
+OPENING é uma operação interna criada na abertura com saldo positivo.
+
+### Ledger e reconciliação
+
+```bash
+curl 'http://localhost:3000/wallets/WALLET_ID/ledger?limit=20'
+
+curl -X POST \
+  http://localhost:3000/wallets/WALLET_ID/reconciliation
+```
+
+O ledger usa paginação por cursor. Utilize o cursor retornado pela API
+na próxima consulta.
+
+A reconciliação detecta divergências e não corrige saldos automaticamente.
+
+## Mensagens SQS
+
+Filas padrão:
+
+- `wager-transactions.fifo`: entrada.
+- `wager-transactions-dlq.fifo`: mensagens inválidas ou com retries esgotados.
+- `wager-events.fifo`: eventos publicados pela outbox.
+
+Envelope de entrada:
+
+```json
+{
+  "messageId": "message-001",
+  "type": "WagerTransactionRequested",
+  "occurredAt": "2026-10-31T12:00:00.000Z",
+  "correlationId": "demo-bet-001",
+  "data": {
+    "idempotencyKey": "provider-demo:bet-001",
+    "providerId": "provider-demo",
+    "externalTransactionId": "bet-001",
+    "playerId": "11111111-1111-4111-8111-111111111111",
+    "walletId": "22222222-2222-4222-8222-222222222222",
+    "roundId": "round-001",
+    "gameId": "game-001",
+    "kind": "BET",
+    "money": {
+      "amount": "25.00",
+      "currency": "BRL"
+    }
+  }
+}
+```
+
+O exemplo exige uma carteira existente com os identificadores informados.
+
+O produtor deve fornecer `MessageGroupId` e `MessageDeduplicationId`
+ao enviar para a fila FIFO.
+
+A identidade de transporte não substitui a idempotência de negócio.
+O consumidor confirma a mensagem somente depois do commit.
+
+## Observabilidade
+
+Os logs da aplicação são JSON e os eventos de negócio incluem
+identificadores de correlação quando disponíveis.
+
+`X-Correlation-Id` é aceito na entrada HTTP e devolvido na resposta.
+
+As métricas incluem:
+
+- Requisições HTTP e duração.
+- Resultados de processamento e replays.
+- Exceções de processamento.
+- Retries de referência, SQS e outbox.
+- Envios do consumidor para a DLQ.
+- Conflitos de persistência.
+- Quantidade e idade de eventos pendentes na outbox.
+- Divergências de reconciliação.
+
+Contadores em memória pertencem a cada processo e reiniciam com ele.
+Um coletor deve consultar cada réplica para agregar essas métricas.
+Consultar `/metrics` pelo gateway retorna apenas uma réplica por chamada.
+
+As métricas de backlog da outbox observam o mesmo banco compartilhado
+e não devem ser somadas entre réplicas.
+
+## Limitações e decisões
+
+- A autenticação de provedor está representada por um guard de extensão,
+  atualmente permissivo. O ambiente não implementa autenticação real.
+- As mensagens SQS são tratadas como um canal interno confiável;
+  identidades e regras financeiras continuam sendo validadas.
+- A entrega de eventos é pelo menos uma vez. Consumidores devem
+  deduplicar por `eventId`.
+- A deduplicação FIFO não substitui a deduplicação persistente.
+- Reversões são integrais; reversões parciais não são suportadas.
+- O esgotamento de retries de infraestrutura no consumidor encaminha
+  a mensagem para DLQ; isso não garante a criação de uma transação FAILED.
+- O ambiente utiliza LocalStack para exercitar a integração SQS.
+  Os testes não substituem uma validação em uma conta AWS real.
+- O Nginx local precisa ser reiniciado após recriar ou escalar réplicas
+  para atualizar os endereços resolvidos.
+
+Veja `ARCHITECTURE.md` para as decisões de consistência e recuperação.
