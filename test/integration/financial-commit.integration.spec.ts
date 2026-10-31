@@ -26,6 +26,11 @@ import {
   ProcessWagerTransaction,
 } from 'src/application/use-cases/process-wager-transaction';
 import { ReferenceRetryWorker } from 'src/infrastructure/workers/reference-retry.worker';
+import { Test } from '@nestjs/testing';
+import { WalletsController } from '../../src/infrastructure/http/wallets.controller';
+import { WageringController } from '../../src/infrastructure/http/wagering.controller';
+import { ProviderAuthGuard } from '../../src/infrastructure/http/provider-auth.guard';
+import { configureHttp } from '../../src/infrastructure/http/configure-http';
 async function captureFailure(action: () => Promise<unknown>): Promise<Error> {
   try {
     await action();
@@ -1081,4 +1086,118 @@ describe('Financial consistency at real commit', () => {
 
     expect(events.rows[0]?.count).toBe('1');
   });
+
+  test('HTTP validates payloads and preserves idempotent results', async () => {
+    const uow = new MikroOrmFinancialUnitOfWork(applicationOrm);
+
+    const testingModule = await Test.createTestingModule({
+      controllers: [WalletsController, WageringController],
+      providers: [
+        ProviderAuthGuard,
+        {
+          provide: OpenWallet,
+          useValue: new OpenWallet(uow),
+        },
+        {
+          provide: ProcessWagerTransaction,
+          useValue: new ProcessWagerTransaction(uow),
+        },
+      ],
+    }).compile();
+
+    const app = testingModule.createNestApplication();
+    configureHttp(app);
+
+    await app.listen(0, '127.0.0.1');
+
+    try {
+      const baseUrl = await app.getUrl();
+      const playerId = randomUUID();
+
+      const createdResponse = await fetch(`${baseUrl}/wallets`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          playerId,
+          initialBalance: {
+            amount: '100.00',
+            currency: 'BRL',
+          },
+        }),
+      });
+
+      expect(createdResponse.status).toBe(201);
+
+      const created: unknown = await createdResponse.json();
+
+      if (
+        typeof created !== 'object' ||
+        created === null ||
+        !('id' in created) ||
+        typeof created.id !== 'string'
+      ) {
+        throw new Error('Invalid wallet response');
+      }
+
+      const externalTransactionId = randomUUID();
+
+      const payload = {
+        providerId: 'provider-a',
+        externalTransactionId,
+        playerId,
+        walletId: created.id,
+        roundId: 'http-round-1',
+        gameId: 'game-1',
+        kind: 'BET',
+        money: { amount: '25.00', currency: 'BRL' },
+      };
+
+      const headers = {
+        'Content-Type': 'application/json',
+        'Idempotency-Key': `provider-a:${externalTransactionId}`,
+      };
+
+      const submit = (body: object) =>
+        fetch(`${baseUrl}/wagering/transactions`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(body),
+        });
+
+      const first = await submit(payload);
+      expect(first.status).toBe(200);
+
+      const firstBody: unknown = await first.json();
+      expect(firstBody).toMatchObject({
+        status: 'PROCESSED',
+        balance: { amount: '75.00', currency: 'BRL' },
+        idempotentReplay: false,
+      });
+
+      const replay = await submit(payload);
+      expect(replay.status).toBe(200);
+
+      const replayBody: unknown = await replay.json();
+      expect(replayBody).toMatchObject({
+        balance: { amount: '75.00', currency: 'BRL' },
+        idempotentReplay: true,
+      });
+
+      const conflict = await submit({
+        ...payload,
+        money: { amount: '26.00', currency: 'BRL' },
+      });
+
+      expect(conflict.status).toBe(409);
+
+      const invalid = await submit({
+        ...payload,
+        money: { amount: 25, currency: 'BRL' },
+      });
+
+      expect(invalid.status).toBe(400);
+    } finally {
+      await app.close();
+    }
+  }, 30_000);
 });

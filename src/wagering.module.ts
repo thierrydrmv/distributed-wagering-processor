@@ -5,10 +5,14 @@ import { OpenWallet } from './application/use-cases/open-wallet';
 import { ProcessWagerTransaction } from './application/use-cases/process-wager-transaction';
 import { DatabaseModule } from './infrastructure/database/database.module';
 import { ReferenceRetryWorker } from './infrastructure/workers/reference-retry.worker';
+import { WalletsController } from './infrastructure/http/wallets.controller';
+import { WageringController } from './infrastructure/http/wagering.controller';
+import { ProviderAuthGuard } from './infrastructure/http/provider-auth.guard';
 
 @Module({
   imports: [DatabaseModule],
   providers: [
+    ProviderAuthGuard,
     {
       provide: OpenWallet,
       useFactory: (uow: FinancialUnitOfWork) => new OpenWallet(uow),
@@ -27,6 +31,7 @@ import { ReferenceRetryWorker } from './infrastructure/workers/reference-retry.w
       inject: [MikroORM, ProcessWagerTransaction],
     },
   ],
+  controllers: [WalletsController, WageringController],
   exports: [OpenWallet, ProcessWagerTransaction],
 })
 export class WageringModule {}
