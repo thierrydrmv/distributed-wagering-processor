@@ -227,3 +227,130 @@ Os testes exercitam PostgreSQL e SQS local, incluindo:
 
 Os testes de crash utilizam SIGKILL real. Alguns prazos de claim são
 antecipados por SQL para reduzir o tempo da suite.
+
+## Autenticação: decisão e evolução
+
+A autenticação não foi implementada nesta entrega, conforme permitido
+pelo enunciado. O ProviderAuthGuard é permissivo e representa o ponto
+de extensão.
+
+Em uma implantação com autenticação, a proposta é utilizar um provedor
+de identidade externo compatível com OIDC, como Keycloak ou Zitadel.
+
+A API validaria a assinatura do access token, issuer, audience e expiração.
+A identidade autenticada seria associada aos providers autorizados.
+
+O providerId recebido no payload precisaria corresponder a um provider
+autorizado para essa identidade. Informar um providerId no corpo da
+requisição não seria suficiente para obter autorização.
+
+Os endpoints de health permaneceriam públicos. As mensagens SQS
+continuariam utilizando as validações de identidade e domínio, com
+controle de acesso ao broker por credenciais e permissões de infraestrutura.
+
+## Hash e identidade do payload
+
+O hash de negócio utiliza SHA-256 sobre JSON canônico, com as chaves
+dos objetos ordenadas recursivamente.
+
+São incluídos:
+
+- providerId;
+- externalTransactionId;
+- playerId;
+- walletId;
+- roundId;
+- gameId;
+- kind;
+- money, com amount e currency;
+- referenceExternalTransactionId, representado como null quando ausente.
+
+A chave de idempotência e os metadados de transporte, como correlationId,
+não entram nesse hash.
+
+A inbox utiliza um hash separado do envelope da mensagem. Ele permite
+detectar a reutilização do mesmo messageId com conteúdo diferente.
+
+## Transições de estado
+
+As transições de processamento são:
+
+| Origem | Destinos permitidos |
+|---|---|
+| PENDING | PENDING_REFERENCE, PROCESSED, REJECTED ou FAILED |
+| PENDING_REFERENCE | PROCESSED, REJECTED ou FAILED |
+| PROCESSED | Nenhum |
+| REJECTED | Nenhum |
+| FAILED | Nenhum |
+
+Uma nova tentativa sem referência mantém PENDING_REFERENCE e não gera
+outro evento de pendência.
+
+Estados terminais não são reabertos. Repetições idempotentes consultam
+o estado persistido, sem reaplicar o movimento financeiro.
+
+FAILED existe no domínio e na persistência para falhas permanentes
+auditáveis. O encaminhamento para DLQ por esgotamento de retries não
+cria automaticamente uma transação FAILED nesta implementação.
+
+## Política de busca de referências
+
+O worker utiliza:
+
+- Até 12 tentativas de busca sem referência.
+- TTL de 15 minutos desde a criação da transação.
+- Backoff exponencial iniciado em 1 segundo e limitado a 60 segundos.
+- Claim com duração de 60 segundos.
+- Consulta periódica a cada segundo, em lotes de até 10 registros.
+
+O limite de tentativas evita buscas indefinidas. O TTL estabelece um teto
+de idade, inclusive quando existem atrasos entre execuções. Qualquer um
+dos limites pode encerrar a espera primeiro.
+
+Falhas de infraestrutura não incrementam o contador de buscas sem
+referência. O registro é reagendado, quando o banco está disponível.
+
+Ao esgotar a espera, a transação é rejeitada com REFERENCE_NOT_FOUND
+e gera WagerTransactionRejected.
+
+Os valores foram escolhidos para demonstrar recuperação e espera limitada
+no desafio. Em produção, precisariam refletir o contrato e o atraso
+esperado dos provedores.
+
+## Códigos de falha
+
+Os códigos financeiros persistidos incluem:
+
+| Código | Significado |
+|---|---|
+| INSUFFICIENT_BALANCE | Saldo insuficiente para BET |
+| REVERSAL_INSUFFICIENT_BALANCE | Reversão exigiria saldo negativo |
+| WALLET_PLAYER_MISMATCH | Carteira pertence a outro jogador |
+| CURRENCY_MISMATCH | Moeda incompatível |
+| REFERENCE_NOT_FOUND | Referência não encontrada até encerrar a espera |
+| REFERENCE_NOT_PROCESSED | Referência não está processada |
+| REFERENCE_MISMATCH | Identidade da referência incompatível |
+| INVALID_REFERENCE_KIND | Tipo da referência não pode ser revertido pela operação |
+| REFERENCE_AMOUNT_MISMATCH | Valor da reversão diferente do original |
+| REFERENCE_ALREADY_REVERSED | Já existe reversão processada do mesmo tipo |
+| BALANCE_LIMIT_EXCEEDED | Crédito ultrapassaria o limite monetário |
+| PERMANENT_INFRASTRUCTURE_FAILURE | Falha permanente representável pelo estado FAILED |
+
+WALLET_NOT_FOUND também é utilizado como erro de aplicação quando a
+carteira não existe; nesse caminho não é criada uma transação financeira.
+
+Erros de contrato e identidade incluem INVALID_IDEMPOTENCY_KEY,
+IDEMPOTENCY_CONFLICT, EXTERNAL_TRANSACTION_CONFLICT,
+INBOX_CONFLICT e INTERNAL_OPERATION_FORBIDDEN.
+
+No transporte SQS, INVALID_MESSAGE identifica envelopes inválidos.
+PROCESSING_RETRIES_EXHAUSTED identifica falhas que atingiram o limite
+de tentativas antes do encaminhamento à DLQ.
+
+Reenviar uma identidade terminal não reabre a transação. Uma correção
+ou nova operação precisa seguir o contrato de identidade do provedor,
+sem reutilizar uma chave com payload diferente.
+
+Para falhas transitórias sem confirmação do resultado, o produtor deve
+repetir a mesma identidade e o mesmo payload, permitindo recuperar um
+eventual commit anterior sem duplicar efeitos.

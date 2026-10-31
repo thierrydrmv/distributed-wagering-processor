@@ -64,16 +64,11 @@ docker compose restart gateway
 ```bash
 bun install --frozen-lockfile
 docker compose up -d postgres localstack
+docker compose stop gateway
 bun run migration:up
 bun run queues:setup
 bun run build
 bun run start:prod
-```
-
-Pare o gateway antes de iniciar a aplicação local na mesma porta:
-
-```bash
-docker compose stop gateway
 ```
 
 A aplicação compilada é executada para preservar os metadados dos decorators
@@ -192,11 +187,19 @@ Respostas de processamento:
 
 - `200`: transação processada.
 - `202`: aguardando referência.
-- `422`: rejeição de negócio.
+- `400`: entrada inválida.
+- `404`: recurso inexistente.
 - `409`: conflito de identidade ou idempotência.
+- `422`: rejeição de negócio.
+- `503`: falha transitória de infraestrutura reconhecida pela aplicação.
+- `500`: falha interna não classificada.
 
-O replay devolve o resultado persistido da transação, incluindo seu saldo
-original, e não o saldo atual da carteira.
+Repetições não reaplicam efeitos financeiros. Para transações terminais,
+a API retorna o resultado persistido, incluindo o saldo registrado no
+processamento original.
+
+Transações pendentes podem apresentar um novo status após o processamento
+pelo worker de referências.
 
 ### Valores e operações
 
@@ -298,6 +301,10 @@ Consultar `/metrics` pelo gateway retorna apenas uma réplica por chamada.
 
 As métricas de backlog da outbox observam o mesmo banco compartilhado
 e não devem ser somadas entre réplicas.
+
+wagering_dlq_messages_total conta confirmações de envio à DLQ realizadas
+pelo consumidor. Não representa o tamanho atual da fila nem inclui
+movimentações automáticas do redrive.
 
 ## Limitações e decisões
 
