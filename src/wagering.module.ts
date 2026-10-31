@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common';
+import { MiddlewareConsumer, Module, NestModule } from '@nestjs/common';
 import { MikroORM } from '@mikro-orm/postgresql';
 import { FinancialUnitOfWork } from './application/ports/financial-unit-of-work';
 import { OpenWallet } from './application/use-cases/open-wallet';
@@ -19,12 +19,15 @@ import {
   HealthController,
   HealthService,
 } from './infrastructure/http/health.controller';
+import { HttpMetricsMiddleware } from './infrastructure/observability/http-metrics.middleware';
+import { MetricsController } from './infrastructure/observability/metrics.controller';
 
 @Module({
   imports: [DatabaseModule],
   providers: [
     ProviderAuthGuard,
     FinancialMetrics,
+    HttpMetricsMiddleware,
     {
       provide: OpenWallet,
       useFactory: (uow: FinancialUnitOfWork) => new OpenWallet(uow),
@@ -75,7 +78,12 @@ import {
     WageringController,
     ProvidersController,
     HealthController,
+    MetricsController,
   ],
   exports: [OpenWallet, ProcessWagerTransaction],
 })
-export class WageringModule {}
+export class WageringModule implements NestModule {
+  configure(consumer: MiddlewareConsumer): void {
+    consumer.apply(HttpMetricsMiddleware).forRoutes('*');
+  }
+}
