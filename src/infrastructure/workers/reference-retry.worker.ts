@@ -202,13 +202,11 @@ export class ReferenceRetryWorker implements OnModuleInit, OnModuleDestroy {
     error: unknown,
     transactionId?: string,
   ): void {
-    this.logger.error(
-      JSON.stringify({
-        event,
-        transactionId,
-        correlationId: transactionId,
-        errorType: error instanceof Error ? error.name : 'UnknownError',
-      }),
-    );
+    this.logger.error({
+      event,
+      transactionId,
+      correlationId: transactionId,
+      errorType: error instanceof Error ? error.name : 'UnknownError',
+    });
   }
 }

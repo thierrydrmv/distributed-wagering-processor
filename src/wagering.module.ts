@@ -26,7 +26,6 @@ import { MetricsController } from './infrastructure/observability/metrics.contro
   imports: [DatabaseModule],
   providers: [
     ProviderAuthGuard,
-    FinancialMetrics,
     HttpMetricsMiddleware,
     {
       provide: OpenWallet,

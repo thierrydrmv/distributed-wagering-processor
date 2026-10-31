@@ -57,12 +57,10 @@ export class MetricsController {
     } catch (error: unknown) {
       this.metrics.outboxCollectionUp.set(0);
 
-      this.logger.error(
-        JSON.stringify({
-          event: 'outbox_metrics_collection_failed',
-          errorType: error instanceof Error ? error.name : 'UnknownError',
-        }),
-      );
+      this.logger.error({
+        event: 'outbox_metrics_collection_failed',
+        errorType: error instanceof Error ? error.name : 'UnknownError',
+      });
     }
   }
 }

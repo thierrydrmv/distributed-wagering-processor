@@ -88,6 +88,13 @@ export class FinancialMetrics implements ProcessingTelemetry {
     registers: [this.registry],
   });
 
+  readonly persistenceConflicts = new Counter({
+    name: 'wagering_persistence_conflicts_total',
+    help: 'Database constraint and concurrency conflicts observed by the financial unit of work',
+    labelNames: ['reason'] as const,
+    registers: [this.registry],
+  });
+
   recordResult(
     source: ProcessingSource,
     status: string,

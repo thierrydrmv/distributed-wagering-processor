@@ -194,27 +194,23 @@ export class OutboxPublisherWorker implements OnModuleInit, OnModuleDestroy {
     );
 
     if (affectedRows !== 1) {
-      this.logger.warn(
-        JSON.stringify({
-          event: 'outbox_claim_lost',
-          eventId: job.id,
-        }),
-      );
+      this.logger.warn({
+        event: 'outbox_claim_lost',
+        eventId: job.id,
+      });
 
       return false;
     }
 
     const payload = message.toState().payload;
 
-    this.logger.log(
-      JSON.stringify({
-        event: 'outbox_event_published',
-        eventId: payload.eventId,
-        eventType: payload.eventType,
-        walletId: payload.aggregateId,
-        correlationId: payload.correlationId,
-      }),
-    );
+    this.logger.log({
+      event: 'outbox_event_published',
+      eventId: payload.eventId,
+      eventType: payload.eventType,
+      aggregateId: payload.aggregateId,
+      correlationId: payload.correlationId,
+    });
 
     return true;
   }
@@ -301,12 +297,10 @@ export class OutboxPublisherWorker implements OnModuleInit, OnModuleDestroy {
   }
 
   private logFailure(event: string, error: unknown, eventId?: string): void {
-    this.logger.error(
-      JSON.stringify({
-        event,
-        eventId,
-        errorType: error instanceof Error ? error.name : 'UnknownError',
-      }),
-    );
+    this.logger.error({
+      event,
+      eventId,
+      errorType: error instanceof Error ? error.name : 'UnknownError',
+    });
   }
 }

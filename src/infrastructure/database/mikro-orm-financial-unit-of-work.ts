@@ -11,9 +11,13 @@ import { MikroOrmWagerTransactionRepository } from '../database/mikro-orm-wager-
 import { MikroOrmWalletLedgerRepository } from './repositories/mikro-orm-wallet-ledger.repository';
 import { MikroOrmOutboxRepository } from './repositories/mikro-orm-outbox.repository';
 import { MikroOrmInboxRepository } from './repositories/mikro-orm-inbox.repository';
+import { FinancialMetrics } from '../observability/financial-metrics';
 
 export class MikroOrmFinancialUnitOfWork extends FinancialUnitOfWork {
-  constructor(private readonly orm: MikroORM) {
+  constructor(
+    private readonly orm: MikroORM,
+    private readonly metrics?: FinancialMetrics,
+  ) {
     super();
   }
 
@@ -42,12 +46,53 @@ export class MikroOrmFinancialUnitOfWork extends FinancialUnitOfWork {
           isolationLevel: IsolationLevel.READ_COMMITTED,
         },
       );
-    } catch (error) {
+    } catch (error: unknown) {
+      const reason = this.conflictReason(error);
+
+      if (reason !== undefined) {
+        this.metrics?.persistenceConflicts.inc({ reason });
+      }
+
       if (error instanceof UniqueConstraintViolationException) {
         throw new PersistenceConflictError(error);
       }
 
       throw error;
     }
+  }
+
+  private conflictReason(error: unknown): string | undefined {
+    if (error instanceof UniqueConstraintViolationException) {
+      return 'unique_constraint';
+    }
+
+    let current: unknown = error;
+
+    for (let depth = 0; depth < 6; depth += 1) {
+      if (typeof current !== 'object' || current === null) {
+        return undefined;
+      }
+
+      if ('code' in current) {
+        switch (current.code) {
+          case '23505':
+            return 'unique_constraint';
+          case '40P01':
+            return 'deadlock';
+          case '40001':
+            return 'serialization_failure';
+          case '55P03':
+            return 'lock_not_available';
+        }
+      }
+
+      if (!('cause' in current)) {
+        return undefined;
+      }
+
+      current = current.cause;
+    }
+
+    return undefined;
   }
 }

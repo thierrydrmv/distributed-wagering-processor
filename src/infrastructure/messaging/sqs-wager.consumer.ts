@@ -165,17 +165,15 @@ export class SqsWagerConsumer implements OnModuleInit, OnModuleDestroy {
           },
         );
 
-        this.logger.log(
-          JSON.stringify({
-            event: 'sqs_transaction_committed',
-            correlationId,
-            messageId: envelope.messageId,
-            transactionId: result.transactionId,
-            walletId: envelope.data.walletId,
-            providerId: envelope.data.providerId,
-            status: result.status,
-          }),
-        );
+        this.logger.log({
+          event: 'sqs_transaction_committed',
+          correlationId,
+          messageId: envelope.messageId,
+          transactionId: result.transactionId,
+          walletId: envelope.data.walletId,
+          providerId: envelope.data.providerId,
+          status: result.status,
+        });
       } catch (error) {
         await this.handleFailure(message, urls, error);
         return;
@@ -423,13 +421,11 @@ export class SqsWagerConsumer implements OnModuleInit, OnModuleDestroy {
   }
 
   private logFailure(event: string, error: unknown, messageId?: string): void {
-    this.logger.error(
-      JSON.stringify({
-        event,
-        messageId,
-        errorType: error instanceof Error ? error.name : 'UnknownError',
-        failureCode: error instanceof WageringError ? error.code : undefined,
-      }),
-    );
+    this.logger.error({
+      event,
+      messageId,
+      errorType: error instanceof Error ? error.name : 'UnknownError',
+      failureCode: error instanceof WageringError ? error.code : undefined,
+    });
   }
 }
