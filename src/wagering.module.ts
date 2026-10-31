@@ -15,6 +15,10 @@ import { SqsWagerConsumer } from './infrastructure/messaging/sqs-wager.consumer'
 import { EventPublisher } from './application/ports/event-publisher';
 import { SqsEventPublisher } from './infrastructure/messaging/sqs-event.publisher';
 import { OutboxPublisherWorker } from './infrastructure/workers/outbox-publisher.worker';
+import {
+  HealthController,
+  HealthService,
+} from './infrastructure/http/health.controller';
 
 @Module({
   imports: [DatabaseModule],
@@ -60,8 +64,18 @@ import { OutboxPublisherWorker } from './infrastructure/workers/outbox-publisher
         new OutboxPublisherWorker(orm, publisher),
       inject: [MikroORM, EventPublisher],
     },
+    {
+      provide: HealthService,
+      inject: [MikroORM],
+      useFactory: (orm: MikroORM) => new HealthService(orm),
+    },
   ],
-  controllers: [WalletsController, WageringController, ProvidersController],
+  controllers: [
+    WalletsController,
+    WageringController,
+    ProvidersController,
+    HealthController,
+  ],
   exports: [OpenWallet, ProcessWagerTransaction],
 })
 export class WageringModule {}
