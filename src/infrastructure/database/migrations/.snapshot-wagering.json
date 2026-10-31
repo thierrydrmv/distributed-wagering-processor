@@ -1,7 +1,5 @@
 {
-  "namespaces": [
-    "public"
-  ],
+  "namespaces": ["public"],
   "name": "public",
   "tables": [
     {
@@ -139,9 +137,7 @@
       "schema": "public",
       "indexes": [
         {
-          "columnNames": [
-            "id"
-          ],
+          "columnNames": ["id"],
           "composite": false,
           "constraint": false,
           "keyName": "outbox_messages_pkey",
@@ -333,14 +329,7 @@
           "scale": null,
           "default": null,
           "comment": null,
-          "enumItems": [
-            "OPENING",
-            "BET",
-            "WIN",
-            "LOSS",
-            "REFUND",
-            "ROLLBACK"
-          ],
+          "enumItems": ["OPENING", "BET", "WIN", "LOSS", "REFUND", "ROLLBACK"],
           "mappedType": "enum"
         },
         "amount": {
@@ -576,11 +565,7 @@
       "schema": "public",
       "indexes": [
         {
-          "columnNames": [
-            "status",
-            "next_reference_attempt_at",
-            "id"
-          ],
+          "columnNames": ["status", "next_reference_attempt_at", "id"],
           "composite": true,
           "constraint": false,
           "keyName": "wager_reference_retry_idx",
@@ -588,9 +573,7 @@
           "primary": false
         },
         {
-          "columnNames": [
-            "idempotency_key"
-          ],
+          "columnNames": ["idempotency_key"],
           "composite": false,
           "constraint": true,
           "keyName": "wager_transactions_idempotency_key_unique",
@@ -598,9 +581,7 @@
           "primary": false
         },
         {
-          "columnNames": [
-            "wallet_id"
-          ],
+          "columnNames": ["wallet_id"],
           "composite": false,
           "constraint": false,
           "keyName": "wager_transactions_opening_unique",
@@ -609,9 +590,7 @@
           "expression": "CREATE UNIQUE INDEX wager_transactions_opening_unique ON public.wager_transactions USING btree (wallet_id) WHERE ((kind = 'OPENING'::text) AND (status = 'PROCESSED'::text))"
         },
         {
-          "columnNames": [
-            "id"
-          ],
+          "columnNames": ["id"],
           "composite": false,
           "constraint": false,
           "keyName": "wager_transactions_pkey",
@@ -619,10 +598,7 @@
           "primary": true
         },
         {
-          "columnNames": [
-            "reference_transaction_id",
-            "kind"
-          ],
+          "columnNames": ["reference_transaction_id", "kind"],
           "composite": true,
           "constraint": false,
           "keyName": "wager_transactions_processed_reversal_unique",
@@ -631,10 +607,7 @@
           "expression": "CREATE UNIQUE INDEX wager_transactions_processed_reversal_unique ON public.wager_transactions USING btree (reference_transaction_id, kind) WHERE ((status = 'PROCESSED'::text) AND (kind = ANY (ARRAY['REFUND'::text, 'ROLLBACK'::text])))"
         },
         {
-          "columnNames": [
-            "provider_id",
-            "external_transaction_id"
-          ],
+          "columnNames": ["provider_id", "external_transaction_id"],
           "composite": true,
           "constraint": true,
           "keyName": "wager_transactions_provider_external_unique",
@@ -642,9 +615,7 @@
           "primary": false
         },
         {
-          "columnNames": [
-            "reference_transaction_id"
-          ],
+          "columnNames": ["reference_transaction_id"],
           "composite": false,
           "constraint": false,
           "keyName": "wager_transactions_reference_idx",
@@ -652,11 +623,7 @@
           "primary": false
         },
         {
-          "columnNames": [
-            "status",
-            "created_at",
-            "id"
-          ],
+          "columnNames": ["status", "created_at", "id"],
           "composite": true,
           "constraint": false,
           "keyName": "wager_transactions_status_created_idx",
@@ -664,11 +631,7 @@
           "primary": false
         },
         {
-          "columnNames": [
-            "wallet_id",
-            "created_at",
-            "id"
-          ],
+          "columnNames": ["wallet_id", "created_at", "id"],
           "composite": true,
           "constraint": false,
           "keyName": "wager_transactions_wallet_created_idx",
@@ -728,28 +691,20 @@
       ],
       "foreignKeys": {
         "wager_transactions_reference_transaction_id_foreign": {
-          "columnNames": [
-            "reference_transaction_id"
-          ],
+          "columnNames": ["reference_transaction_id"],
           "constraintName": "wager_transactions_reference_transaction_id_foreign",
           "localTableName": "public.wager_transactions",
           "referencedTableName": "public.wager_transactions",
-          "referencedColumnNames": [
-            "id"
-          ],
+          "referencedColumnNames": ["id"],
           "updateRule": "restrict",
           "deleteRule": "restrict"
         },
         "wager_transactions_wallet_id_foreign": {
-          "columnNames": [
-            "wallet_id"
-          ],
+          "columnNames": ["wallet_id"],
           "constraintName": "wager_transactions_wallet_id_foreign",
           "localTableName": "public.wager_transactions",
           "referencedTableName": "public.wallets",
-          "referencedColumnNames": [
-            "id"
-          ],
+          "referencedColumnNames": ["id"],
           "updateRule": "restrict",
           "deleteRule": "restrict"
         }
@@ -820,10 +775,7 @@
           "scale": null,
           "default": null,
           "comment": null,
-          "enumItems": [
-            "DEBIT",
-            "CREDIT"
-          ],
+          "enumItems": ["DEBIT", "CREDIT"],
           "mappedType": "enum"
         },
         "amount": {
@@ -911,9 +863,7 @@
       "schema": "public",
       "indexes": [
         {
-          "columnNames": [
-            "transaction_id"
-          ],
+          "columnNames": ["transaction_id"],
           "composite": false,
           "constraint": false,
           "keyName": "ledger_transaction_idx",
@@ -921,11 +871,7 @@
           "primary": false
         },
         {
-          "columnNames": [
-            "wallet_id",
-            "created_at",
-            "id"
-          ],
+          "columnNames": ["wallet_id", "created_at", "id"],
           "composite": true,
           "constraint": false,
           "keyName": "ledger_wallet_created_id_idx",
@@ -933,10 +879,7 @@
           "primary": false
         },
         {
-          "columnNames": [
-            "wallet_id",
-            "transaction_id"
-          ],
+          "columnNames": ["wallet_id", "transaction_id"],
           "composite": true,
           "constraint": true,
           "keyName": "ledger_wallet_transaction_unique",
@@ -944,9 +887,7 @@
           "primary": false
         },
         {
-          "columnNames": [
-            "id"
-          ],
+          "columnNames": ["id"],
           "composite": false,
           "constraint": false,
           "keyName": "wallet_ledger_entries_pkey",
@@ -982,28 +923,20 @@
       ],
       "foreignKeys": {
         "wallet_ledger_entries_transaction_id_foreign": {
-          "columnNames": [
-            "transaction_id"
-          ],
+          "columnNames": ["transaction_id"],
           "constraintName": "wallet_ledger_entries_transaction_id_foreign",
           "localTableName": "public.wallet_ledger_entries",
           "referencedTableName": "public.wager_transactions",
-          "referencedColumnNames": [
-            "id"
-          ],
+          "referencedColumnNames": ["id"],
           "updateRule": "restrict",
           "deleteRule": "restrict"
         },
         "wallet_ledger_entries_wallet_id_foreign": {
-          "columnNames": [
-            "wallet_id"
-          ],
+          "columnNames": ["wallet_id"],
           "constraintName": "wallet_ledger_entries_wallet_id_foreign",
           "localTableName": "public.wallet_ledger_entries",
           "referencedTableName": "public.wallets",
-          "referencedColumnNames": [
-            "id"
-          ],
+          "referencedColumnNames": ["id"],
           "updateRule": "restrict",
           "deleteRule": "restrict"
         }
@@ -1130,9 +1063,7 @@
       "schema": "public",
       "indexes": [
         {
-          "columnNames": [
-            "id"
-          ],
+          "columnNames": ["id"],
           "composite": false,
           "constraint": false,
           "keyName": "wallets_pkey",
@@ -1140,10 +1071,7 @@
           "primary": true
         },
         {
-          "columnNames": [
-            "player_id",
-            "currency"
-          ],
+          "columnNames": ["player_id", "currency"],
           "composite": true,
           "constraint": true,
           "keyName": "wallets_player_currency_unique",

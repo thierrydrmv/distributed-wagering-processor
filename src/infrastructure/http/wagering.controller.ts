@@ -4,7 +4,10 @@ import {
   Controller,
   Headers,
   HttpCode,
+  Param,
+  ParseUUIDPipe,
   Post,
+  Get,
   Res,
   UseGuards,
 } from '@nestjs/common';
@@ -14,6 +17,7 @@ import type { ProcessWagerResponse } from '../../application/use-cases/process-w
 import { WagerTransactionStatus } from '../../domain/entities/wager-transaction';
 import { ProcessWagerDto } from './dto/wagering.dto';
 import { ProviderAuthGuard } from './provider-auth.guard';
+import { WageringQueries } from '../database/queries/wagering.queries';
 
 const responseStatus: Record<WagerTransactionStatus, number> = {
   [WagerTransactionStatus.Pending]: 202,
@@ -26,7 +30,18 @@ const responseStatus: Record<WagerTransactionStatus, number> = {
 @Controller('wagering')
 @UseGuards(ProviderAuthGuard)
 export class WageringController {
-  constructor(private readonly processor: ProcessWagerTransaction) {}
+  constructor(
+    private readonly processor: ProcessWagerTransaction,
+    private readonly queries: WageringQueries,
+  ) {}
+
+  @Get('transactions/:transactionId')
+  getTransaction(
+    @Param('transactionId', new ParseUUIDPipe())
+    transactionId: string,
+  ) {
+    return this.queries.getTransactionById(transactionId);
+  }
 
   @Post('transactions')
   @HttpCode(200)

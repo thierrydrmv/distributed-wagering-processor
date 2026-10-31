@@ -2,11 +2,15 @@ import { Type } from 'class-transformer';
 import {
   IsDefined,
   IsIn,
+  IsInt,
   IsObject,
+  IsOptional,
   IsString,
   IsUUID,
   Length,
   Matches,
+  Max,
+  Min,
   ValidateIf,
   ValidateNested,
 } from 'class-validator';
@@ -80,4 +84,17 @@ export class ProcessWagerDto {
   @Length(1, 255)
   @Matches(/\S/)
   referenceExternalTransactionId?: string;
+}
+
+export class LedgerQueryDto {
+  @IsOptional()
+  @IsString()
+  @Length(1, 2048)
+  cursor?: string;
+
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(100)
+  limit = 50;
 }

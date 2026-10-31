@@ -31,6 +31,8 @@ import { WalletsController } from '../../src/infrastructure/http/wallets.control
 import { WageringController } from '../../src/infrastructure/http/wagering.controller';
 import { ProviderAuthGuard } from '../../src/infrastructure/http/provider-auth.guard';
 import { configureHttp } from '../../src/infrastructure/http/configure-http';
+import { WageringQueries } from '../../src/infrastructure/database/queries/wagering.queries';
+import { FinancialMetrics } from '../../src/infrastructure/observability/financial-metrics';
 async function captureFailure(action: () => Promise<unknown>): Promise<Error> {
   try {
     await action();
@@ -954,7 +956,25 @@ describe('Financial consistency at real commit', () => {
 
     const worker = new ReferenceRetryWorker(applicationOrm, processor);
 
-    await worker.runOnce();
+    const due = await client.query<{ due_at_ms: string }>(
+      `
+    select
+      ceil(
+        extract(epoch from next_reference_attempt_at) * 1000
+      )::text as due_at_ms
+    from wager_transactions
+    where id = $1
+  `,
+      [pending.transactionId],
+    );
+
+    const dueAtMs = Number(due.rows[0]?.due_at_ms);
+
+    if (!Number.isSafeInteger(dueAtMs)) {
+      throw new Error('Invalid reference retry timestamp');
+    }
+
+    await worker.runOnce(new Date(dueAtMs + 1));
 
     const stored = await client.query<{
       status: string;
@@ -1102,6 +1122,10 @@ describe('Financial consistency at real commit', () => {
           provide: ProcessWagerTransaction,
           useValue: new ProcessWagerTransaction(uow),
         },
+        {
+          provide: WageringQueries,
+          useValue: new WageringQueries(applicationOrm, new FinancialMetrics()),
+        },
       ],
     }).compile();
 
@@ -1200,4 +1224,79 @@ describe('Financial consistency at real commit', () => {
       await app.close();
     }
   }, 30_000);
+
+  test('queries transactions and paginates and reconciles the ledger', async () => {
+    const { processor, wallet, request } = await wageringFixture();
+
+    const betRequest = request();
+    const bet = await processor.execute(betRequest);
+
+    await processor.execute(
+      request({
+        kind: WagerTransactionKind.Win,
+        money: { amount: '10.00', currency: 'BRL' },
+      }),
+    );
+
+    const queries = new WageringQueries(applicationOrm, new FinancialMetrics());
+
+    const currentWallet = await queries.getWallet(wallet.id);
+    expect(currentWallet.balance.amount).toBe('85.00');
+
+    const byId = await queries.getTransactionById(bet.transactionId);
+
+    const byExternal = await queries.getTransactionByExternalId(
+      betRequest.providerId,
+      betRequest.externalTransactionId,
+    );
+
+    expect(byId.transactionId).toBe(byExternal.transactionId);
+    expect(byId.balance?.amount).toBe('75.00');
+
+    const first = await queries.getLedger(wallet.id, 1);
+
+    expect(first.items).toHaveLength(1);
+
+    if (first.nextCursor === null) {
+      throw new Error('Expected another ledger page');
+    }
+
+    const second = await queries.getLedger(wallet.id, 1, first.nextCursor);
+
+    expect(second.items).toHaveLength(1);
+
+    if (second.nextCursor === null) {
+      throw new Error('Expected a third ledger page');
+    }
+
+    const third = await queries.getLedger(wallet.id, 1, second.nextCursor);
+
+    expect(third.items).toHaveLength(1);
+    expect(third.nextCursor).toBeNull();
+
+    const ids = [...first.items, ...second.items, ...third.items].map(
+      (entry) => entry.id,
+    );
+
+    expect(new Set(ids).size).toBe(3);
+
+    const invalidCursor = await captureFailure(() =>
+      queries.getLedger(wallet.id, 1, 'invalid-cursor'),
+    );
+
+    expect(invalidCursor).toMatchObject({
+      code: 'INVALID_CURSOR',
+    });
+
+    const reconciliation = await queries.reconcile(wallet.id);
+
+    expect(reconciliation).toEqual({
+      walletId: wallet.id,
+      storedBalance: { amount: '85.00', currency: 'BRL' },
+      calculatedBalance: { amount: '85.00', currency: 'BRL' },
+      difference: { amount: '0.00', currency: 'BRL' },
+      consistent: true,
+      checkedEntries: 3,
+    });
+  });
 });
