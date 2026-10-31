@@ -46,6 +46,7 @@ import type { EventPublisher } from '../../src/application/ports/event-publisher
 import { SqsEventPublisher } from '../../src/infrastructure/messaging/sqs-event.publisher';
 import { OutboxPublisherWorker } from '../../src/infrastructure/workers/outbox-publisher.worker';
 import { PersistenceConflictError } from '../../src/application/errors/wagering-error';
+import { startApplicationProcess } from '../helpers/application-process';
 
 async function captureFailure(action: () => Promise<unknown>): Promise<Error> {
   try {
@@ -2011,5 +2012,348 @@ describe('Financial consistency at real commit', () => {
         version: 1,
       },
     ]);
+  });
+
+  test('three application processes preserve idempotency and prevent overspending', async () => {
+    const connectionString = process.env.TEST_DATABASE_URL;
+
+    if (!connectionString) {
+      throw new Error('TEST_DATABASE_URL is required');
+    }
+
+    const databaseUrl = new URL(connectionString);
+    databaseUrl.pathname = `/${databaseName}`;
+
+    const applications: Awaited<ReturnType<typeof startApplicationProcess>>[] =
+      [];
+
+    let shutdowns: PromiseSettledResult<{
+      code: number | null;
+      signal: NodeJS.Signals | null;
+    }>[] = [];
+
+    try {
+      // Inicia sequencialmente para garantir limpeza
+      // dos processos anteriores se algum startup falhar.
+      for (let index = 0; index < 3; index += 1) {
+        applications.push(
+          await startApplicationProcess(databaseUrl.toString()),
+        );
+      }
+
+      const { wallet, request } = await wageringFixture();
+
+      async function submit(index: number, input: ProcessWagerRequest) {
+        const application = applications[index];
+
+        if (!application) {
+          throw new Error('Application process is unavailable');
+        }
+
+        const { idempotencyKey, correlationId, ...body } = input;
+
+        return fetch(`${application.baseUrl}/wagering/transactions`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Idempotency-Key': idempotencyKey,
+            'X-Correlation-Id': correlationId ?? randomUUID(),
+          },
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(15_000),
+        });
+      }
+
+      // A mesma operação chega aos três processos.
+      const duplicate = request({
+        money: {
+          amount: '10.00',
+          currency: 'BRL',
+        },
+      });
+
+      const duplicateResponses = await Promise.all(
+        Array.from({ length: 12 }, (_, index) => submit(index % 3, duplicate)),
+      );
+
+      for (const response of duplicateResponses) {
+        const body: unknown = await response.json();
+
+        expect(response.status).toBe(200);
+
+        expect(body).toMatchObject({
+          status: 'PROCESSED',
+          balance: {
+            amount: '90.00',
+            currency: 'BRL',
+          },
+        });
+      }
+
+      // Há 90 disponíveis. Apenas um dos três débitos
+      // distintos de 60 pode ser processado.
+      const spendingResponses = await Promise.all(
+        Array.from({ length: 3 }, (_, index) =>
+          submit(
+            index,
+            request({
+              money: {
+                amount: '60.00',
+                currency: 'BRL',
+              },
+            }),
+          ),
+        ),
+      );
+
+      expect(
+        spendingResponses
+          .map((response) => response.status)
+          .sort((left, right) => left - right),
+      ).toEqual([200, 422, 422]);
+
+      for (const response of spendingResponses) {
+        const body: unknown = await response.json();
+
+        if (response.status === 422) {
+          expect(body).toMatchObject({
+            status: 'REJECTED',
+            failureCode: 'INSUFFICIENT_BALANCE',
+          });
+        }
+      }
+
+      const stored = await client.query<{
+        balance: string;
+        version: number;
+        debits: string;
+        processed: string;
+        rejected: string;
+      }>(
+        `
+        select
+          w.balance,
+          w.version,
+          (
+            select count(*)
+            from wallet_ledger_entries l
+            where l.wallet_id = w.id
+              and l.direction = 'DEBIT'
+          ) as debits,
+          (
+            select count(*)
+            from wager_transactions t
+            where t.wallet_id = w.id
+              and t.kind = 'BET'
+              and t.status = 'PROCESSED'
+          ) as processed,
+          (
+            select count(*)
+            from wager_transactions t
+            where t.wallet_id = w.id
+              and t.kind = 'BET'
+              and t.status = 'REJECTED'
+          ) as rejected
+        from wallets w
+        where w.id = $1::uuid
+      `,
+        [wallet.id],
+      );
+
+      expect(stored.rows).toEqual([
+        {
+          balance: '30.00',
+          version: 3,
+          debits: '2',
+          processed: '2',
+          rejected: '2',
+        },
+      ]);
+    } finally {
+      shutdowns = await Promise.allSettled(
+        applications.map((application) => application.stop()),
+      );
+    }
+
+    for (const shutdown of shutdowns) {
+      if (shutdown.status === 'rejected') {
+        throw shutdown.reason;
+      }
+
+      const { code, signal } = shutdown.value;
+
+      expect(code === 0 || signal === 'SIGTERM').toBe(true);
+    }
+  }, 90_000);
+
+  test('recovers a committed transaction after an abrupt process crash', async () => {
+    const connectionString = process.env.TEST_DATABASE_URL;
+
+    if (!connectionString) {
+      throw new Error('TEST_DATABASE_URL is required');
+    }
+
+    const databaseUrl = new URL(connectionString);
+    databaseUrl.pathname = `/${databaseName}`;
+
+    const applications: Awaited<ReturnType<typeof startApplicationProcess>>[] =
+      [];
+
+    let shutdowns: PromiseSettledResult<{
+      code: number | null;
+      signal: NodeJS.Signals | null;
+    }>[] = [];
+
+    try {
+      const { wallet, request } = await wageringFixture();
+
+      const input = request({
+        money: {
+          amount: '25.00',
+          currency: 'BRL',
+        },
+      });
+
+      const { idempotencyKey, correlationId, ...payload } = input;
+
+      async function submit(baseUrl: string) {
+        const response = await fetch(`${baseUrl}/wagering/transactions`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Idempotency-Key': idempotencyKey,
+            'X-Correlation-Id': correlationId ?? randomUUID(),
+          },
+          body: JSON.stringify(payload),
+          signal: AbortSignal.timeout(15_000),
+        });
+
+        const body: unknown = await response.json();
+
+        expect(response.status).toBe(200);
+
+        return body;
+      }
+
+      const first = await startApplicationProcess(databaseUrl.toString());
+
+      applications.push(first);
+
+      const original = await submit(first.baseUrl);
+
+      expect(original).toMatchObject({
+        status: 'PROCESSED',
+        balance: {
+          amount: '75.00',
+          currency: 'BRL',
+        },
+        idempotentReplay: false,
+      });
+
+      const crashed = await first.crash();
+
+      expect(crashed.signal).toBe('SIGKILL');
+
+      const replacement = await startApplicationProcess(databaseUrl.toString());
+
+      applications.push(replacement);
+
+      const replay = await submit(replacement.baseUrl);
+
+      if (
+        typeof original !== 'object' ||
+        original === null ||
+        !('transactionId' in original) ||
+        typeof original.transactionId !== 'string'
+      ) {
+        throw new Error('Invalid original transaction response');
+      }
+
+      expect(replay).toMatchObject({
+        transactionId: original.transactionId,
+        status: 'PROCESSED',
+        balance: {
+          amount: '75.00',
+          currency: 'BRL',
+        },
+        idempotentReplay: true,
+      });
+
+      const stored = await client.query<{
+        balance: string;
+        version: number;
+        transactions: string;
+        debits: string;
+        pending_events: string;
+      }>(
+        `
+        select
+          w.balance,
+          w.version,
+          (
+            select count(*)
+            from wager_transactions t
+            where t.wallet_id = w.id
+              and t.kind = 'BET'
+          ) as transactions,
+          (
+            select count(*)
+            from wallet_ledger_entries l
+            where l.wallet_id = w.id
+              and l.direction = 'DEBIT'
+          ) as debits,
+          (
+            select count(*)
+            from outbox_messages o
+            where o.aggregate_id = w.id
+              and o.published_at is null
+          ) as pending_events
+        from wallets w
+        where w.id = $1::uuid
+      `,
+        [wallet.id],
+      );
+
+      expect(stored.rows).toEqual([
+        {
+          balance: '75.00',
+          version: 2,
+          transactions: '1',
+          debits: '1',
+          pending_events: '4',
+        },
+      ]);
+    } finally {
+      // O primeiro processo já foi encerrado por SIGKILL.
+      // Aqui finalizamos os processos restantes.
+      shutdowns = await Promise.allSettled(
+        applications.slice(1).map((application) => application.stop()),
+      );
+
+      // Também cobre uma falha antes de crash() ser chamado.
+      await Promise.allSettled(
+        applications.slice(0, 1).map((application) => application.stop()),
+      );
+    }
+
+    for (const shutdown of shutdowns) {
+      if (shutdown.status === 'rejected') {
+        throw shutdown.reason;
+      }
+
+      expect(
+        shutdown.value.code === 0 || shutdown.value.signal === 'SIGTERM',
+      ).toBe(true);
+    }
+  }, 90_000);
+
+  test('reference worker refuses new batches after shutdown', async () => {
+    const { processor, metrics } = await wageringFixture();
+
+    const worker = new ReferenceRetryWorker(applicationOrm, processor, metrics);
+
+    await worker.onModuleDestroy();
+
+    expect(await worker.runOnce()).toBe(0);
   });
 });

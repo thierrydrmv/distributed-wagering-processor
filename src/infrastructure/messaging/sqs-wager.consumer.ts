@@ -175,6 +175,8 @@ export class SqsWagerConsumer implements OnModuleInit, OnModuleDestroy {
           status: result.status,
         });
       } catch (error) {
+        await stopHeartbeat();
+
         await this.handleFailure(message, urls, error);
         return;
       }

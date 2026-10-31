@@ -18,6 +18,7 @@ export class ReferenceRetryWorker implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(ReferenceRetryWorker.name);
   private timer: ReturnType<typeof setInterval> | undefined;
   private inFlight: Promise<number> | undefined;
+  private stopping = false;
 
   private readonly maxAttempts = 12;
   private readonly ttlMs = 15 * 60 * 1_000;
@@ -43,6 +44,8 @@ export class ReferenceRetryWorker implements OnModuleInit, OnModuleDestroy {
   }
 
   async onModuleDestroy(): Promise<void> {
+    this.stopping = true;
+
     if (this.timer !== undefined) {
       clearInterval(this.timer);
     }
@@ -55,7 +58,7 @@ export class ReferenceRetryWorker implements OnModuleInit, OnModuleDestroy {
       throw new Error('Invalid reference worker date');
     }
 
-    if (this.inFlight !== undefined) {
+    if (this.stopping || this.inFlight !== undefined) {
       return 0;
     }
 
