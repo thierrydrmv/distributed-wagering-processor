@@ -247,6 +247,51 @@ describe('Financial consistency at real commit', () => {
     };
   };
 
+  async function assertWalletsConsistent(walletIds: string[]): Promise<void> {
+    const result = await client.query<{
+      id: string;
+      stored_balance: string;
+      calculated_balance: string;
+      consistent: boolean;
+    }>(
+      `
+      select
+        w.id,
+        w.balance::text as stored_balance,
+        totals.balance::text as calculated_balance,
+        w.balance = totals.balance as consistent
+      from wallets w
+      cross join lateral (
+        select coalesce(
+          sum(
+            case
+              when l.direction = 'CREDIT' then l.amount
+              else -l.amount
+            end
+          ),
+          0::numeric
+        ) as balance
+        from wallet_ledger_entries l
+        where l.wallet_id = w.id
+      ) totals
+      where w.id = any($1::uuid[])
+    `,
+      [walletIds],
+    );
+
+    expect(result.rows).toHaveLength(new Set(walletIds).size);
+
+    for (const row of result.rows) {
+      expect({
+        walletId: row.id,
+        consistent: row.consistent,
+      }).toEqual({
+        walletId: row.id,
+        consistent: true,
+      });
+    }
+  }
+
   beforeAll(async () => {
     const connectionString = process.env.TEST_DATABASE_URL;
 
@@ -939,6 +984,7 @@ describe('Financial consistency at real commit', () => {
     );
 
     expect(persisted.rows).toEqual([{ balance: '75.00', debits: '1' }]);
+    await assertWalletsConsistent([wallet.id]);
   });
 
   test('two concurrent bets cannot overspend the wallet', async () => {
@@ -973,6 +1019,7 @@ describe('Financial consistency at real commit', () => {
     );
 
     expect(persisted.rows).toEqual([{ balance: '20.00' }]);
+    await assertWalletsConsistent([wallet.id]);
   });
 
   test('replay returns the original balance after later movements', async () => {
@@ -1685,6 +1732,7 @@ describe('Financial consistency at real commit', () => {
       );
 
       expect(remaining.Messages ?? []).toHaveLength(0);
+      await assertWalletsConsistent([wallet.id]);
     } finally {
       await fixture.dispose();
     }
@@ -2175,6 +2223,8 @@ describe('Financial consistency at real commit', () => {
           rejected: '2',
         },
       ]);
+
+      await assertWalletsConsistent([wallet.id]);
     } finally {
       shutdowns = await Promise.allSettled(
         applications.map((application) => application.stop()),
@@ -2329,6 +2379,7 @@ describe('Financial consistency at real commit', () => {
           pending_events: '4',
         },
       ]);
+      await assertWalletsConsistent([wallet.id]);
     } finally {
       // O primeiro processo já foi encerrado por SIGKILL.
       // Aqui finalizamos os processos restantes.
@@ -2563,6 +2614,7 @@ describe('Financial consistency at real commit', () => {
       );
 
       expect(remaining.Messages ?? []).toHaveLength(0);
+      await assertWalletsConsistent([wallet.id]);
     } finally {
       await fixture.dispose();
     }
@@ -2782,8 +2834,86 @@ describe('Financial consistency at real commit', () => {
       );
 
       expect(remaining.Messages ?? []).toHaveLength(0);
+      await assertWalletsConsistent([wallet.id]);
     } finally {
       await fixture.dispose();
     }
   }, 60_000);
+
+  test('processes distinct wallets concurrently with consistent ledgers', async () => {
+    const fixtures = await Promise.all(
+      Array.from({ length: 6 }, () => wageringFixture()),
+    );
+
+    // Todas as operações são iniciadas antes de aguardarmos
+    // seus resultados: seis wallets, três apostas por wallet.
+    const results = await Promise.all(
+      fixtures.flatMap(({ processor, request }) =>
+        Array.from({ length: 3 }, () =>
+          processor.execute(
+            request({
+              money: {
+                amount: '20.00',
+                currency: 'BRL',
+              },
+            }),
+          ),
+        ),
+      ),
+    );
+
+    expect(results).toHaveLength(18);
+
+    for (const result of results) {
+      expect(result.status).toBe(WagerTransactionStatus.Processed);
+      expect(result.idempotentReplay).toBe(false);
+    }
+
+    const walletIds = fixtures.map(({ wallet }) => wallet.id);
+
+    const stored = await client.query<{
+      id: string;
+      balance: string;
+      version: number;
+      debits: string;
+      processed_bets: string;
+    }>(
+      `
+      select
+        w.id,
+        w.balance::text as balance,
+        w.version,
+        (
+          select count(*)
+          from wallet_ledger_entries l
+          where l.wallet_id = w.id
+            and l.direction = 'DEBIT'
+        ) as debits,
+        (
+          select count(*)
+          from wager_transactions t
+          where t.wallet_id = w.id
+            and t.kind = 'BET'
+            and t.status = 'PROCESSED'
+        ) as processed_bets
+      from wallets w
+      where w.id = any($1::uuid[])
+    `,
+      [walletIds],
+    );
+
+    expect(stored.rows).toHaveLength(6);
+
+    for (const row of stored.rows) {
+      expect(row).toEqual({
+        id: row.id,
+        balance: '40.00',
+        version: 4,
+        debits: '3',
+        processed_bets: '3',
+      });
+    }
+
+    await assertWalletsConsistent(walletIds);
+  }, 30_000);
 });
