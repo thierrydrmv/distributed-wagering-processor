@@ -24,6 +24,7 @@ import { OpenWallet } from 'src/application/use-cases/open-wallet';
 import {
   ProcessWagerRequest,
   ProcessWagerTransaction,
+  ProcessWagerResponse,
 } from 'src/application/use-cases/process-wager-transaction';
 import { ReferenceRetryWorker } from 'src/infrastructure/workers/reference-retry.worker';
 import { Test } from '@nestjs/testing';
@@ -118,6 +119,7 @@ describe('Financial consistency at real commit', () => {
   const consumerFixture = async (
     processor: ProcessWagerTransaction,
     metrics?: FinancialMetrics,
+    maxAttempts = 5,
   ) => {
     const endpoint = process.env.TEST_SQS_ENDPOINT;
 
@@ -165,6 +167,7 @@ describe('Financial consistency at real commit', () => {
         endpoint,
         transactionsQueue,
         dlqQueue,
+        maxAttempts,
       },
       metrics,
     );
@@ -2916,4 +2919,166 @@ describe('Financial consistency at real commit', () => {
 
     await assertWalletsConsistent(walletIds);
   }, 30_000);
+
+  test('retries transient processing failures and sends the message to DLQ after the limit', async () => {
+    class TemporarilyUnavailableProcessor extends ProcessWagerTransaction {
+      attempts = 0;
+
+      override execute(): Promise<ProcessWagerResponse> {
+        this.attempts += 1;
+
+        return Promise.reject(
+          new Error('Simulated transient database failure'),
+        );
+      }
+    }
+
+    const { wallet, request, metrics } = await wageringFixture();
+
+    const processor = new TemporarilyUnavailableProcessor(
+      new MikroOrmFinancialUnitOfWork(applicationOrm, metrics),
+      metrics,
+    );
+
+    const fixture = await consumerFixture(processor, metrics, 3);
+
+    try {
+      const input = request();
+
+      const body = JSON.stringify({
+        messageId: randomUUID(),
+        type: 'WagerTransactionRequested',
+        occurredAt: new Date().toISOString(),
+        data: input,
+      });
+
+      await fixture.sqs.send(
+        new SendMessageCommand({
+          QueueUrl: fixture.sourceUrl,
+          MessageBody: body,
+          MessageGroupId: wallet.id,
+          MessageDeduplicationId: randomUUID(),
+        }),
+      );
+
+      // Primeira falha: deve agendar retry, sem enviar à DLQ.
+      expect(await fixture.consumer.runOnce(2)).toBe(1);
+      expect(processor.attempts).toBe(1);
+
+      const firstRetry = await metrics.retries.get();
+
+      expect(firstRetry.values).toEqual([
+        {
+          labels: { component: 'sqs' },
+          value: 1,
+        },
+      ]);
+
+      const beforeLimit = await metrics.dlqMessages.get();
+
+      expect(beforeLimit.values).toEqual([
+        {
+          labels: {},
+          value: 0,
+        },
+      ]);
+
+      // Aguarda as redeliveries reais, respeitando
+      // a visibilidade definida pelo consumidor.
+      const deadline = Date.now() + 20_000;
+
+      while (processor.attempts < 3 && Date.now() < deadline) {
+        await fixture.consumer.runOnce(2);
+      }
+
+      expect(processor.attempts).toBe(3);
+
+      // As duas primeiras falhas reagendam.
+      // A terceira envia à DLQ.
+      const retries = await metrics.retries.get();
+
+      expect(retries.values).toEqual([
+        {
+          labels: { component: 'sqs' },
+          value: 2,
+        },
+      ]);
+
+      const dlqMetric = await metrics.dlqMessages.get();
+
+      expect(dlqMetric.values).toEqual([
+        {
+          labels: {},
+          value: 1,
+        },
+      ]);
+
+      const dlq = await fixture.sqs.send(
+        new ReceiveMessageCommand({
+          QueueUrl: fixture.dlqUrl,
+          WaitTimeSeconds: 2,
+          MessageAttributeNames: ['All'],
+        }),
+      );
+
+      expect(dlq.Messages).toHaveLength(1);
+      expect(dlq.Messages?.[0]?.Body).toBe(body);
+
+      expect(
+        dlq.Messages?.[0]?.MessageAttributes?.failureCode?.StringValue,
+      ).toBe('PROCESSING_RETRIES_EXHAUSTED');
+
+      const remaining = await fixture.sqs.send(
+        new ReceiveMessageCommand({
+          QueueUrl: fixture.sourceUrl,
+          WaitTimeSeconds: 1,
+        }),
+      );
+
+      expect(remaining.Messages ?? []).toHaveLength(0);
+
+      // A falha injetada acontece antes de executar
+      // a operação financeira: a carteira deve permanecer intacta.
+      const stored = await client.query<{
+        balance: string;
+        version: number;
+        bets: string;
+        debits: string;
+      }>(
+        `
+        select
+          w.balance::text as balance,
+          w.version,
+          (
+            select count(*)
+            from wager_transactions t
+            where t.wallet_id = w.id
+              and t.kind = 'BET'
+          ) as bets,
+          (
+            select count(*)
+            from wallet_ledger_entries l
+            where l.wallet_id = w.id
+              and l.direction = 'DEBIT'
+          ) as debits
+        from wallets w
+        where w.id = $1::uuid
+      `,
+        [wallet.id],
+      );
+
+      expect(stored.rows).toEqual([
+        {
+          balance: '100.00',
+          version: 1,
+          bets: '0',
+          debits: '0',
+        },
+      ]);
+
+      await assertWalletsConsistent([wallet.id]);
+    } finally {
+      await fixture.dispose();
+    }
+  }, 40_000);
 });
