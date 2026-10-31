@@ -40,6 +40,7 @@ import {
   ReceiveMessageCommand,
   SendMessageCommand,
   ChangeMessageVisibilityCommand,
+  GetQueueAttributesCommand,
 } from '@aws-sdk/client-sqs';
 import { createSqsClient } from '../../src/infrastructure/messaging/sqs-client';
 import { SqsWagerConsumer } from '../../src/infrastructure/messaging/sqs-wager.consumer';
@@ -3081,4 +3082,222 @@ describe('Financial consistency at real commit', () => {
       await fixture.dispose();
     }
   }, 40_000);
+
+  test('SIGTERM drains an in-flight SQS message before shutting down', async () => {
+    const connectionString = process.env.TEST_DATABASE_URL;
+    const endpoint = process.env.TEST_SQS_ENDPOINT;
+
+    if (!connectionString || !endpoint) {
+      throw new Error('TEST_DATABASE_URL and TEST_SQS_ENDPOINT are required');
+    }
+
+    const databaseUrl = new URL(connectionString);
+    databaseUrl.pathname = `/${databaseName}`;
+
+    const { processor, wallet, request } = await wageringFixture();
+
+    const fixture = await consumerFixture(processor);
+
+    const blocker = new Client({
+      connectionString: databaseUrl.toString(),
+    });
+
+    let blockerConnected = false;
+    let lockHeld = false;
+
+    let application:
+      Awaited<ReturnType<typeof startApplicationProcess>> | undefined;
+
+    let shutdown:
+      | ReturnType<Awaited<ReturnType<typeof startApplicationProcess>>['stop']>
+      | undefined;
+
+    try {
+      await blocker.connect();
+      blockerConnected = true;
+
+      await blocker.query('BEGIN');
+      lockHeld = true;
+
+      await blocker.query(
+        `
+        select id
+        from wallets
+        where id = $1::uuid
+        for update
+      `,
+        [wallet.id],
+      );
+
+      application = await startApplicationProcess(databaseUrl.toString(), {
+        SQS_ENDPOINT: endpoint,
+        SQS_CONSUMER_ENABLED: 'true',
+        SQS_TRANSACTIONS_QUEUE: fixture.transactionsQueue,
+        SQS_TRANSACTIONS_DLQ: fixture.dlqQueue,
+      });
+
+      const input = request();
+
+      await fixture.sqs.send(
+        new SendMessageCommand({
+          QueueUrl: fixture.sourceUrl,
+          MessageBody: JSON.stringify({
+            messageId: randomUUID(),
+            type: 'WagerTransactionRequested',
+            occurredAt: new Date().toISOString(),
+            data: input,
+          }),
+          MessageGroupId: wallet.id,
+          MessageDeduplicationId: randomUUID(),
+        }),
+      );
+
+      // Aguarda evidência de que uma conexão desse banco
+      // está bloqueada ao tentar acessar a carteira.
+      let waitingForWallet = false;
+      const deadline = Date.now() + 15_000;
+
+      while (Date.now() < deadline) {
+        const activity = await client.query<{
+          waiting: boolean;
+        }>(
+          `
+          select exists (
+            select 1
+            from pg_stat_activity
+            where datname = current_database()
+              and pid <> pg_backend_pid()
+              and wait_event_type = 'Lock'
+              and query ilike '%wallets%'
+          ) as waiting
+        `,
+        );
+
+        if (activity.rows[0]?.waiting) {
+          waitingForWallet = true;
+          break;
+        }
+
+        await new Promise<void>((resolveWait) => {
+          setTimeout(resolveWait, 50);
+        });
+      }
+
+      expect(waitingForWallet).toBe(true);
+
+      // stop() envia SIGTERM. A mensagem ainda não pode
+      // terminar porque esta conexão mantém o lock.
+      shutdown = application.stop();
+
+      // Instala imediatamente o tratamento da promise.
+      const outcome = shutdown.then(
+        (value) => ({
+          kind: 'exited' as const,
+          value,
+        }),
+        (error: unknown) => ({
+          kind: 'failed' as const,
+          error,
+        }),
+      );
+
+      const early = await Promise.race([
+        outcome,
+        new Promise<{ kind: 'waiting' }>((resolveWait) => {
+          setTimeout(() => resolveWait({ kind: 'waiting' }), 250);
+        }),
+      ]);
+
+      // Não deve abandonar a mensagem e sair imediatamente.
+      expect(early.kind).toBe('waiting');
+
+      // Permite que o consumidor finalize a transação.
+      await blocker.query('ROLLBACK');
+      lockHeld = false;
+
+      const completed = await outcome;
+
+      if (completed.kind === 'failed') {
+        throw completed.error;
+      }
+
+      expect(
+        completed.value.code === 0 || completed.value.signal === 'SIGTERM',
+      ).toBe(true);
+
+      const stored = await client.query<{
+        balance: string;
+        version: number;
+        status: string;
+        debits: string;
+      }>(
+        `
+        select
+          w.balance::text as balance,
+          w.version,
+          t.status,
+          (
+            select count(*)
+            from wallet_ledger_entries l
+            where l.wallet_id = w.id
+              and l.direction = 'DEBIT'
+          ) as debits
+        from wallets w
+        join wager_transactions t
+          on t.wallet_id = w.id
+        where w.id = $1::uuid
+          and t.idempotency_key = $2
+      `,
+        [wallet.id, input.idempotencyKey],
+      );
+
+      expect(stored.rows).toEqual([
+        {
+          balance: '75.00',
+          version: 2,
+          status: 'PROCESSED',
+          debits: '1',
+        },
+      ]);
+
+      await assertWalletsConsistent([wallet.id]);
+
+      // Verifica também mensagens invisíveis: uma consulta
+      // ReceiveMessage vazia sozinha não provaria o ACK.
+      const queue = await fixture.sqs.send(
+        new GetQueueAttributesCommand({
+          QueueUrl: fixture.sourceUrl,
+          AttributeNames: [
+            'ApproximateNumberOfMessages',
+            'ApproximateNumberOfMessagesNotVisible',
+          ],
+        }),
+      );
+
+      expect(queue.Attributes?.ApproximateNumberOfMessages).toBe('0');
+
+      expect(queue.Attributes?.ApproximateNumberOfMessagesNotVisible).toBe('0');
+    } finally {
+      // Libera o banco antes de aguardar o processo.
+      if (lockHeld) {
+        await blocker.query('ROLLBACK');
+      }
+
+      try {
+        if (shutdown) {
+          await Promise.allSettled([shutdown]);
+        } else if (application) {
+          await application.stop();
+        }
+      } finally {
+        try {
+          if (blockerConnected) {
+            await blocker.end();
+          }
+        } finally {
+          await fixture.dispose();
+        }
+      }
+    }
+  }, 60_000);
 });

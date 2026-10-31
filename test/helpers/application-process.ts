@@ -32,7 +32,10 @@ async function availablePort(): Promise<number> {
   });
 }
 
-export async function startApplicationProcess(databaseUrl: string) {
+export async function startApplicationProcess(
+  databaseUrl: string,
+  overrides: NodeJS.ProcessEnv = {},
+) {
   const entrypoint = resolve('dist/main.js');
 
   await access(entrypoint);
@@ -50,6 +53,7 @@ export async function startApplicationProcess(databaseUrl: string) {
       REFERENCE_WORKER_ENABLED: 'false',
       SQS_CONSUMER_ENABLED: 'false',
       OUTBOX_PUBLISHER_ENABLED: 'false',
+      ...overrides,
     },
     stdio: ['ignore', 'ignore', 'pipe'],
   });
