@@ -29,6 +29,8 @@ import type {
   StoredWagerTransaction,
 } from '../ports/financial-unit-of-work';
 import { payloadHash } from '../utils/payload-hash';
+import { InboxMessage } from '../inbox/inbox-message';
+import type { InboxDelivery } from '../inbox/inbox-message';
 
 export interface ProcessWagerRequest {
   idempotencyKey: string;
@@ -55,7 +57,10 @@ export interface ProcessWagerResponse {
 export class ProcessWagerTransaction {
   constructor(private readonly uow: FinancialUnitOfWork) {}
 
-  async execute(request: ProcessWagerRequest): Promise<ProcessWagerResponse> {
+  async execute(
+    request: ProcessWagerRequest,
+    delivery?: InboxDelivery,
+  ): Promise<ProcessWagerResponse> {
     if (!request.idempotencyKey?.trim()) {
       throw new WageringError(
         'INVALID_IDEMPOTENCY_KEY',
@@ -117,53 +122,35 @@ export class ProcessWagerTransaction {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       try {
         return await this.uow.execute(async (context) => {
-          const existing = await context.transactions.findByIdempotencyKey(
-            request.idempotencyKey,
+          const inboxMessage =
+            delivery === undefined
+              ? undefined
+              : await this.receiveInbox(context, delivery);
+
+          const result = await this.executeFinancial(
+            context,
+            request,
+            hash,
+            createTransaction(),
+            correlationId,
           );
 
-          if (existing !== null) {
-            return this.replay(existing, hash);
+          if (inboxMessage !== undefined) {
+            if (inboxMessage.isProcessed()) {
+              if (inboxMessage.transactionId !== result.transactionId) {
+                throw new WageringError(
+                  'INBOX_CONFLICT',
+                  'Inbox message refers to another transaction',
+                );
+              }
+            } else {
+              inboxMessage.markProcessed(result.transactionId, new Date());
+
+              await context.inbox.save(inboxMessage);
+            }
           }
 
-          const wallet = await context.wallets.findByIdForUpdate(
-            request.walletId,
-          );
-
-          if (wallet === null) {
-            throw new WageringError(
-              'WALLET_NOT_FOUND',
-              'Wallet does not exist',
-            );
-          }
-
-          // Outra execução pode ter confirmado enquanto
-          // esta aguardava o lock da wallet.
-          const afterLock = await context.transactions.findByIdempotencyKey(
-            request.idempotencyKey,
-          );
-
-          if (afterLock !== null) {
-            return this.replay(afterLock, hash);
-          }
-
-          const sameExternal =
-            await context.transactions.findByProviderExternalId(
-              request.providerId,
-              request.externalTransactionId,
-            );
-
-          if (sameExternal !== null) {
-            throw new WageringError(
-              'EXTERNAL_TRANSACTION_CONFLICT',
-              'External transaction already exists under another key',
-            );
-          }
-
-          const transaction = createTransaction();
-
-          await context.transactions.insert(transaction);
-
-          return this.apply(context, transaction, wallet, correlationId);
+          return result;
         });
       } catch (error) {
         if (error instanceof PersistenceConflictError && attempt === 0) {
@@ -473,5 +460,81 @@ export class ProcessWagerTransaction {
     event: IntegrationEvent<object>,
   ): Promise<void> {
     await context.outbox.insert(OutboxMessage.enqueue(event));
+  }
+
+  private async receiveInbox(
+    context: FinancialTransactionContext,
+    delivery: InboxDelivery,
+  ): Promise<InboxMessage> {
+    const existing = await context.inbox.findByIdentity(
+      delivery.consumerName,
+      delivery.messageId,
+    );
+
+    if (existing !== null) {
+      if (!existing.matchesPayload(delivery.payloadHash)) {
+        throw new WageringError(
+          'INBOX_CONFLICT',
+          'Message identity was reused with another payload',
+        );
+      }
+
+      return existing;
+    }
+
+    const message = InboxMessage.receive({
+      ...delivery,
+      receivedAt: new Date(),
+    });
+
+    await context.inbox.insert(message);
+
+    return message;
+  }
+
+  private async executeFinancial(
+    context: FinancialTransactionContext,
+    request: ProcessWagerRequest,
+    hash: string,
+    transaction: WagerTransaction,
+    correlationId: string,
+  ): Promise<ProcessWagerResponse> {
+    const existing = await context.transactions.findByIdempotencyKey(
+      request.idempotencyKey,
+    );
+
+    if (existing !== null) {
+      return this.replay(existing, hash);
+    }
+
+    const wallet = await context.wallets.findByIdForUpdate(request.walletId);
+
+    if (wallet === null) {
+      throw new WageringError('WALLET_NOT_FOUND', 'Wallet does not exist');
+    }
+
+    const afterLock = await context.transactions.findByIdempotencyKey(
+      request.idempotencyKey,
+    );
+
+    if (afterLock !== null) {
+      return this.replay(afterLock, hash);
+    }
+
+    const sameExternal = await context.transactions.findByProviderExternalId(
+      request.providerId,
+      request.externalTransactionId,
+    );
+
+    if (sameExternal !== null) {
+      throw new WageringError(
+        'EXTERNAL_TRANSACTION_CONFLICT',
+        'External transaction already exists under another key',
+      );
+    }
+
+    await context.transactions.insert(transaction);
+
+    return this.apply(context, transaction, wallet, correlationId);
   }
 }

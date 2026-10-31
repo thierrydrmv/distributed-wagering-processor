@@ -6,6 +6,7 @@ import type {
 } from '../../domain/entities/wager-transaction';
 import type { Money } from '../../domain/value-objects/money';
 import { OutboxMessage } from '../outbox/outbox-message';
+import type { InboxMessage } from '../inbox/inbox-message';
 
 export interface WalletRepository {
   insert(wallet: Wallet): Promise<void>;
@@ -53,6 +54,7 @@ export interface FinancialTransactionContext {
   transactions: WagerTransactionRepository;
   ledger: WalletLedgerRepository;
   outbox: OutboxRepository;
+  inbox: InboxRepository;
 }
 
 export abstract class FinancialUnitOfWork {
@@ -63,4 +65,15 @@ export abstract class FinancialUnitOfWork {
 
 export interface OutboxRepository {
   insert(message: OutboxMessage): Promise<void>;
+}
+
+export interface InboxRepository {
+  findByIdentity(
+    consumerName: string,
+    messageId: string,
+  ): Promise<InboxMessage | null>;
+
+  insert(message: InboxMessage): Promise<void>;
+
+  save(message: InboxMessage): Promise<void>;
 }

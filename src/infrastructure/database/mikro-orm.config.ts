@@ -6,6 +6,7 @@ import { WalletSchema } from './entities/wallet.record';
 import { WagerTransactionSchema } from './entities/wager-transaction.record';
 import { WalletLedgerEntrySchema } from './entities/wallet-ledger-entry.record';
 import { OutboxMessageSchema } from './entities/outbox-message.record';
+import { InboxMessageSchema } from './entities/inbox-message.record';
 
 const clientUrl = process.env.DATABASE_URL;
 
@@ -20,6 +21,7 @@ export default defineConfig({
     WagerTransactionSchema,
     WalletLedgerEntrySchema,
     OutboxMessageSchema,
+    InboxMessageSchema,
   ],
 
   extensions: [Migrator],

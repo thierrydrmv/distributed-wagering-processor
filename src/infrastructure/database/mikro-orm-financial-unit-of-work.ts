@@ -10,6 +10,7 @@ import { MikroOrmWalletRepository } from './repositories/mikro-orm-wallet.reposi
 import { MikroOrmWagerTransactionRepository } from '../database/mikro-orm-wager-transaction.repository';
 import { MikroOrmWalletLedgerRepository } from './repositories/mikro-orm-wallet-ledger.repository';
 import { MikroOrmOutboxRepository } from './repositories/mikro-orm-outbox.repository';
+import { MikroOrmInboxRepository } from './repositories/mikro-orm-inbox.repository';
 
 export class MikroOrmFinancialUnitOfWork extends FinancialUnitOfWork {
   constructor(private readonly orm: MikroORM) {
@@ -32,6 +33,7 @@ export class MikroOrmFinancialUnitOfWork extends FinancialUnitOfWork {
             transactions: new MikroOrmWagerTransactionRepository(transactionEm),
             ledger: new MikroOrmWalletLedgerRepository(transactionEm),
             outbox: new MikroOrmOutboxRepository(transactionEm),
+            inbox: new MikroOrmInboxRepository(transactionEm),
           };
 
           return work(context);

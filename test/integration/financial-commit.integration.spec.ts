@@ -1299,4 +1299,84 @@ describe('Financial consistency at real commit', () => {
       checkedEntries: 3,
     });
   });
+
+  test('deduplicates concurrent inbox deliveries without another debit', async () => {
+    const { processor, wallet, request } = await wageringFixture();
+    const input = request();
+
+    const delivery = {
+      consumerName: 'wager-transactions-v1',
+      messageId: randomUUID(),
+      payloadHash: 'a'.repeat(64),
+    };
+
+    const results = await Promise.all(
+      Array.from({ length: 10 }, () => processor.execute(input, delivery)),
+    );
+
+    expect(new Set(results.map((result) => result.transactionId)).size).toBe(1);
+
+    const inbox = await client.query<{
+      count: string;
+      processed: string;
+    }>(
+      `
+      select
+        count(*) as count,
+        count(processed_at) as processed
+      from inbox_messages
+      where consumer_name = $1 and message_id = $2
+    `,
+      [delivery.consumerName, delivery.messageId],
+    );
+
+    expect(inbox.rows).toEqual([{ count: '1', processed: '1' }]);
+
+    const storedWallet = await client.query<{ balance: string }>(
+      'select balance from wallets where id = $1',
+      [wallet.id],
+    );
+
+    expect(storedWallet.rows).toEqual([{ balance: '75.00' }]);
+
+    const conflict = await captureFailure(() =>
+      processor.execute(input, {
+        ...delivery,
+        payloadHash: 'b'.repeat(64),
+      }),
+    );
+
+    expect(conflict).toMatchObject({
+      code: 'INBOX_CONFLICT',
+    });
+  });
+
+  test('rolls back the inbox when financial processing fails', async () => {
+    const { processor, request } = await wageringFixture();
+
+    const delivery = {
+      consumerName: 'wager-transactions-v1',
+      messageId: randomUUID(),
+      payloadHash: 'c'.repeat(64),
+    };
+
+    const error = await captureFailure(() =>
+      processor.execute(request({ walletId: randomUUID() }), delivery),
+    );
+
+    expect(error).toMatchObject({
+      code: 'WALLET_NOT_FOUND',
+    });
+
+    const persisted = await client.query<{ count: string }>(
+      `
+      select count(*) as count
+      from inbox_messages
+      where consumer_name = $1 and message_id = $2
+    `,
+      [delivery.consumerName, delivery.messageId],
+    );
+
+    expect(persisted.rows[0]?.count).toBe('0');
+  });
 });
