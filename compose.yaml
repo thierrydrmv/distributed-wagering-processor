@@ -1,3 +1,22 @@
+x-app-environment: &app-environment
+  NODE_ENV: production
+  PORT: '3000'
+
+  DATABASE_URL: postgresql://${POSTGRES_USER:?POSTGRES_USER is required}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:?POSTGRES_DB is required}
+
+  AWS_REGION: ${AWS_REGION:-us-east-1}
+  AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-test}
+  AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-test}
+
+  SQS_ENDPOINT: http://localstack:4566
+  SQS_TRANSACTIONS_QUEUE: ${SQS_TRANSACTIONS_QUEUE:-wager-transactions.fifo}
+  SQS_TRANSACTIONS_DLQ: ${SQS_TRANSACTIONS_DLQ:-wager-transactions-dlq.fifo}
+  SQS_EVENTS_QUEUE: ${SQS_EVENTS_QUEUE:-wager-events.fifo}
+
+  REFERENCE_WORKER_ENABLED: 'true'
+  SQS_CONSUMER_ENABLED: 'true'
+  OUTBOX_PUBLISHER_ENABLED: 'true'
+
 services:
   postgres:
     image: postgres:17
@@ -36,6 +55,64 @@ services:
       timeout: 10s
       retries: 20
       start_period: 15s
+
+  migrate:
+    image: distributed-wagering-processor:local
+    build: .
+    environment: *app-environment
+    command: ['bun', 'dist/scripts/migrate.js']
+    restart: 'no'
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  setup-queues:
+    image: distributed-wagering-processor:local
+    build: .
+    environment: *app-environment
+    command: ['bun', 'dist/scripts/setup-queues.js']
+    restart: 'no'
+    depends_on:
+      localstack:
+        condition: service_healthy
+
+  app:
+    image: distributed-wagering-processor:local
+    build: .
+    environment: *app-environment
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 90s
+    expose:
+      - '3000'
+    deploy:
+      replicas: 3
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      setup-queues:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - bun
+        - -e
+        - "const response = await fetch('http://127.0.0.1:3000/health/ready', { signal: AbortSignal.timeout(5000) }); process.exit(response.ok ? 0 : 1);"
+      interval: 10s
+      timeout: 6s
+      retries: 6
+      start_period: 20s
+
+  gateway:
+    image: nginx:stable-alpine
+    ports:
+      - '127.0.0.1:3000:80'
+    volumes:
+      - ./docker/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      app:
+        condition: service_healthy
+    restart: unless-stopped
 
 volumes:
   postgres_data:

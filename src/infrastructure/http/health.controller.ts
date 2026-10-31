@@ -20,6 +20,7 @@ export class HealthService implements OnModuleDestroy {
       ...(process.env.SQS_ENDPOINT
         ? { endpoint: process.env.SQS_ENDPOINT }
         : {}),
+      useQueueUrlAsEndpoint: false,
       maxAttempts: 1,
     });
   }
