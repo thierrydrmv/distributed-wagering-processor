@@ -10,6 +10,24 @@ O domínio não depende de NestJS, MikroORM ou AWS SDK.
 
 HTTP e SQS executam o mesmo caso de uso financeiro.
 
+## Escolhas técnicas e trade-offs
+
+MikroORM foi escolhido por permitir uma Unit of Work explícita e
+repositórios compartilhando o mesmo EntityManager transacional.
+
+Os registros de persistência são separados das entidades de domínio.
+Valores numeric são mapeados como strings e reconstruídos como Money,
+preservando a precisão e evitando dependência do domínio em tipos do ORM.
+
+O bloqueio pessimista por wallet simplifica a proteção contra saldo
+negativo e lost updates entre processos. O custo é a serialização das
+operações sobre uma carteira muito disputada. Carteiras diferentes
+não compartilham um lock global.
+
+Os triggers diferidos reforçam a integridade no commit, mas aumentam
+a complexidade das migrations e o custo das verificações do histórico.
+Para volumes maiores, esse custo precisaria ser medido e otimizado.
+
 ## Precisão monetária
 
 Money utiliza Decimal.js com precisão configurada para preservar os valores
@@ -224,6 +242,10 @@ Os testes exercitam PostgreSQL e SQS local, incluindo:
 - Queda depois de commit HTTP.
 - Queda entre commit e ACK SQS.
 - Queda entre envio ao SQS e confirmação na outbox.
+- Wallets distintas processadas em paralelo.
+- Reconciliação após cenários concorrentes e de recuperação.
+- Retry transitório do consumidor até o limite e encaminhamento à DLQ.
+- SIGTERM com mensagem em andamento, verificando commit e ACK.
 
 Os testes de crash utilizam SIGKILL real. Alguns prazos de claim são
 antecipados por SQL para reduzir o tempo da suite.
@@ -275,13 +297,13 @@ detectar a reutilização do mesmo messageId com conteúdo diferente.
 
 As transições de processamento são:
 
-| Origem | Destinos permitidos |
-|---|---|
-| PENDING | PENDING_REFERENCE, PROCESSED, REJECTED ou FAILED |
-| PENDING_REFERENCE | PROCESSED, REJECTED ou FAILED |
-| PROCESSED | Nenhum |
-| REJECTED | Nenhum |
-| FAILED | Nenhum |
+| Origem            | Destinos permitidos                              |
+| ----------------- | ------------------------------------------------ |
+| PENDING           | PENDING_REFERENCE, PROCESSED, REJECTED ou FAILED |
+| PENDING_REFERENCE | PROCESSED, REJECTED ou FAILED                    |
+| PROCESSED         | Nenhum                                           |
+| REJECTED          | Nenhum                                           |
+| FAILED            | Nenhum                                           |
 
 Uma nova tentativa sem referência mantém PENDING_REFERENCE e não gera
 outro evento de pendência.
@@ -303,8 +325,10 @@ O worker utiliza:
 - Claim com duração de 60 segundos.
 - Consulta periódica a cada segundo, em lotes de até 10 registros.
 
-O limite de tentativas evita buscas indefinidas. O TTL estabelece um teto
-de idade, inclusive quando existem atrasos entre execuções. Qualquer um
+O limite de tentativas evita buscas indefinidas. O TTL é verificado quando o
+worker retoma o processamento. Uma transação pode permanecer pendente além
+desse prazo se o serviço estiver indisponível;
+na próxima execução, será considerada expirada. Qualquer um
 dos limites pode encerrar a espera primeiro.
 
 Falhas de infraestrutura não incrementam o contador de buscas sem
@@ -321,20 +345,20 @@ esperado dos provedores.
 
 Os códigos financeiros persistidos incluem:
 
-| Código | Significado |
-|---|---|
-| INSUFFICIENT_BALANCE | Saldo insuficiente para BET |
-| REVERSAL_INSUFFICIENT_BALANCE | Reversão exigiria saldo negativo |
-| WALLET_PLAYER_MISMATCH | Carteira pertence a outro jogador |
-| CURRENCY_MISMATCH | Moeda incompatível |
-| REFERENCE_NOT_FOUND | Referência não encontrada até encerrar a espera |
-| REFERENCE_NOT_PROCESSED | Referência não está processada |
-| REFERENCE_MISMATCH | Identidade da referência incompatível |
-| INVALID_REFERENCE_KIND | Tipo da referência não pode ser revertido pela operação |
-| REFERENCE_AMOUNT_MISMATCH | Valor da reversão diferente do original |
-| REFERENCE_ALREADY_REVERSED | Já existe reversão processada do mesmo tipo |
-| BALANCE_LIMIT_EXCEEDED | Crédito ultrapassaria o limite monetário |
-| PERMANENT_INFRASTRUCTURE_FAILURE | Falha permanente representável pelo estado FAILED |
+| Código                           | Significado                                             |
+| -------------------------------- | ------------------------------------------------------- |
+| INSUFFICIENT_BALANCE             | Saldo insuficiente para BET                             |
+| REVERSAL_INSUFFICIENT_BALANCE    | Reversão exigiria saldo negativo                        |
+| WALLET_PLAYER_MISMATCH           | Carteira pertence a outro jogador                       |
+| CURRENCY_MISMATCH                | Moeda incompatível                                      |
+| REFERENCE_NOT_FOUND              | Referência não encontrada até encerrar a espera         |
+| REFERENCE_NOT_PROCESSED          | Referência não está processada                          |
+| REFERENCE_MISMATCH               | Identidade da referência incompatível                   |
+| INVALID_REFERENCE_KIND           | Tipo da referência não pode ser revertido pela operação |
+| REFERENCE_AMOUNT_MISMATCH        | Valor da reversão diferente do original                 |
+| REFERENCE_ALREADY_REVERSED       | Já existe reversão processada do mesmo tipo             |
+| BALANCE_LIMIT_EXCEEDED           | Crédito ultrapassaria o limite monetário                |
+| PERMANENT_INFRASTRUCTURE_FAILURE | Falha permanente representável pelo estado FAILED       |
 
 WALLET_NOT_FOUND também é utilizado como erro de aplicação quando a
 carteira não existe; nesse caminho não é criada uma transação financeira.
