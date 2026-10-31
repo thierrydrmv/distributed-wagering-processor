@@ -5,6 +5,7 @@ import { MikroORM } from '@mikro-orm/postgresql';
 import { WagerTransactionStatus } from '../../domain/entities/wager-transaction';
 import { ProcessWagerTransaction } from '../../application/use-cases/process-wager-transaction';
 import { WagerTransactionRecord } from '../database/entities/wager-transaction.record';
+import { FinancialMetrics } from '../observability/financial-metrics';
 
 interface ReferenceJob {
   id: string;
@@ -24,6 +25,7 @@ export class ReferenceRetryWorker implements OnModuleInit, OnModuleDestroy {
   constructor(
     private readonly orm: MikroORM,
     private readonly processor: ProcessWagerTransaction,
+    private readonly metrics?: FinancialMetrics,
   ) {}
 
   onModuleInit(): void {
@@ -157,6 +159,27 @@ export class ReferenceRetryWorker implements OnModuleInit, OnModuleDestroy {
       : 1_000;
 
     const em = this.orm.em.fork();
+
+    const affectedRows = await em.nativeUpdate(
+      WagerTransactionRecord,
+      {
+        id: job.id,
+        status: WagerTransactionStatus.PendingReference,
+        referenceClaimToken: job.claimToken,
+      },
+      {
+        referenceAttempts: attempts,
+        nextReferenceAttemptAt: new Date(now.getTime() + delayMs),
+        referenceClaimToken: null,
+        referenceClaimedUntil: null,
+      },
+    );
+
+    if (affectedRows === 1 && countAttempt) {
+      this.metrics?.retries.inc({
+        component: 'reference',
+      });
+    }
 
     await em.nativeUpdate(
       WagerTransactionRecord,

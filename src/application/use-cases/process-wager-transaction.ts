@@ -31,6 +31,10 @@ import type {
 import { payloadHash } from '../utils/payload-hash';
 import { InboxMessage } from '../inbox/inbox-message';
 import type { InboxDelivery } from '../inbox/inbox-message';
+import type {
+  ProcessingSource,
+  ProcessingTelemetry,
+} from '../ports/processing-telemetry';
 
 export interface ProcessWagerRequest {
   idempotencyKey: string;
@@ -55,9 +59,12 @@ export interface ProcessWagerResponse {
 }
 
 export class ProcessWagerTransaction {
-  constructor(private readonly uow: FinancialUnitOfWork) {}
+  constructor(
+    private readonly uow: FinancialUnitOfWork,
+    private readonly telemetry?: ProcessingTelemetry,
+  ) {}
 
-  async execute(
+  private async executeInternal(
     request: ProcessWagerRequest,
     delivery?: InboxDelivery,
   ): Promise<ProcessWagerResponse> {
@@ -164,7 +171,13 @@ export class ProcessWagerTransaction {
     throw new Error('Transaction retry limit exhausted');
   }
 
-  async resumePendingReference(
+  execute(request: ProcessWagerRequest, delivery?: InboxDelivery) {
+    return this.observeProcessing(delivery ? 'sqs' : 'http', () =>
+      this.executeInternal(request, delivery),
+    );
+  }
+
+  private async resumePendingReferenceInternal(
     transactionId: string,
     expired = false,
   ): Promise<ProcessWagerResponse> {
@@ -218,6 +231,15 @@ export class ProcessWagerTransaction {
 
       return this.apply(context, current.transaction, wallet, transactionId);
     });
+  }
+
+  resumePendingReference(
+    transactionId: string,
+    expired = false,
+  ): Promise<ProcessWagerResponse> {
+    return this.observeProcessing('reference', () =>
+      this.resumePendingReferenceInternal(transactionId, expired),
+    );
   }
 
   private async apply(
@@ -536,5 +558,34 @@ export class ProcessWagerTransaction {
     await context.transactions.insert(transaction);
 
     return this.apply(context, transaction, wallet, correlationId);
+  }
+
+  private async observeProcessing<
+    T extends {
+      status: string;
+      idempotentReplay: boolean;
+    },
+  >(source: ProcessingSource, work: () => Promise<T>): Promise<T> {
+    const startedAt = performance.now();
+
+    try {
+      const result = await work();
+
+      this.telemetry?.recordResult(
+        source,
+        result.status,
+        result.idempotentReplay,
+      );
+
+      return result;
+    } catch (error: unknown) {
+      this.telemetry?.recordFailure(source);
+      throw error;
+    } finally {
+      this.telemetry?.observeDuration(
+        source,
+        (performance.now() - startedAt) / 1_000,
+      );
+    }
   }
 }

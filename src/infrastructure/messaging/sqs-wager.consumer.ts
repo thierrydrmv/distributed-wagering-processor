@@ -18,6 +18,7 @@ import { InvalidMoneyError } from '../../domain/value-objects/money';
 import { InvalidWagerTransactionError } from '../../domain/entities/wager-transaction';
 import { createSqsClient, queueNames } from './sqs-client';
 import { SqsWagerMessageDto } from './sqs-wager.dto';
+import { FinancialMetrics } from '../observability/financial-metrics';
 
 interface QueueUrls {
   transactions: string;
@@ -48,6 +49,7 @@ export class SqsWagerConsumer implements OnModuleInit, OnModuleDestroy {
       transactionsQueue: queueNames().transactions,
       dlqQueue: queueNames().dlq,
     },
+    private readonly metrics?: FinancialMetrics,
   ) {
     this.sqs = createSqsClient(options.endpoint);
     this.maxAttempts = options.maxAttempts ?? 5;
@@ -226,7 +228,7 @@ export class SqsWagerConsumer implements OnModuleInit, OnModuleDestroy {
             ? 'INVALID_MESSAGE'
             : 'PROCESSING_RETRIES_EXHAUSTED';
 
-      // Só remove da origem depois de confirmar o envio à DLQ.
+      // Confirma o envio à DLQ antes de excluir da origem.
       await this.sqs.send(
         new SendMessageCommand({
           QueueUrl: urls.dlq,
@@ -243,6 +245,8 @@ export class SqsWagerConsumer implements OnModuleInit, OnModuleDestroy {
         }),
       );
 
+      this.metrics?.dlqMessages.inc();
+
       await this.sqs.send(
         new DeleteMessageCommand({
           QueueUrl: urls.transactions,
@@ -258,6 +262,13 @@ export class SqsWagerConsumer implements OnModuleInit, OnModuleDestroy {
       : Math.min(30, 2 ** Math.min(attempts - 1, 5));
 
     await this.changeVisibility(urls.transactions, receiptHandle, delay);
+
+    // Liberação durante shutdown não conta como retry agendado.
+    if (delay > 0) {
+      this.metrics?.retries.inc({
+        component: 'sqs',
+      });
+    }
   }
 
   private async parseMessage(

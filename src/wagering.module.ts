@@ -35,15 +35,9 @@ import { MetricsController } from './infrastructure/observability/metrics.contro
     },
     {
       provide: ProcessWagerTransaction,
-      useFactory: (uow: FinancialUnitOfWork) =>
-        new ProcessWagerTransaction(uow),
-      inject: [FinancialUnitOfWork],
-    },
-    {
-      provide: ReferenceRetryWorker,
-      useFactory: (orm: MikroORM, processor: ProcessWagerTransaction) =>
-        new ReferenceRetryWorker(orm, processor),
-      inject: [MikroORM, ProcessWagerTransaction],
+      useFactory: (uow: FinancialUnitOfWork, metrics: FinancialMetrics) =>
+        new ProcessWagerTransaction(uow, metrics),
+      inject: [FinancialUnitOfWork, FinancialMetrics],
     },
     {
       provide: WageringQueries,
@@ -52,25 +46,39 @@ import { MetricsController } from './infrastructure/observability/metrics.contro
       inject: [MikroORM, FinancialMetrics],
     },
     {
-      provide: SqsWagerConsumer,
-      useFactory: (processor: ProcessWagerTransaction) =>
-        new SqsWagerConsumer(processor),
-      inject: [ProcessWagerTransaction],
-    },
-    {
       provide: EventPublisher,
       useFactory: () => new SqsEventPublisher(),
-    },
-    {
-      provide: OutboxPublisherWorker,
-      useFactory: (orm: MikroORM, publisher: EventPublisher) =>
-        new OutboxPublisherWorker(orm, publisher),
-      inject: [MikroORM, EventPublisher],
     },
     {
       provide: HealthService,
       inject: [MikroORM],
       useFactory: (orm: MikroORM) => new HealthService(orm),
+    },
+    {
+      provide: ReferenceRetryWorker,
+      useFactory: (
+        orm: MikroORM,
+        processor: ProcessWagerTransaction,
+        metrics: FinancialMetrics,
+      ) => new ReferenceRetryWorker(orm, processor, metrics),
+      inject: [MikroORM, ProcessWagerTransaction, FinancialMetrics],
+    },
+    {
+      provide: SqsWagerConsumer,
+      useFactory: (
+        processor: ProcessWagerTransaction,
+        metrics: FinancialMetrics,
+      ) => new SqsWagerConsumer(processor, undefined, metrics),
+      inject: [ProcessWagerTransaction, FinancialMetrics],
+    },
+    {
+      provide: OutboxPublisherWorker,
+      useFactory: (
+        orm: MikroORM,
+        publisher: EventPublisher,
+        metrics: FinancialMetrics,
+      ) => new OutboxPublisherWorker(orm, publisher, undefined, metrics),
+      inject: [MikroORM, EventPublisher, FinancialMetrics],
     },
   ],
   controllers: [

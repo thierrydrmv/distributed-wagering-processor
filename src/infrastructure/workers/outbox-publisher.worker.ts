@@ -5,6 +5,7 @@ import { MikroORM } from '@mikro-orm/postgresql';
 import { OutboxMessage } from '../../application/outbox/outbox-message';
 import type { EventPublisher } from '../../application/ports/event-publisher';
 import { OutboxMessageRecord } from '../database/entities/outbox-message.record';
+import { FinancialMetrics } from '../observability/financial-metrics';
 
 interface OutboxJob {
   id: string;
@@ -28,6 +29,7 @@ export class OutboxPublisherWorker implements OnModuleInit, OnModuleDestroy {
     private readonly orm: MikroORM,
     private readonly publisher: EventPublisher,
     private readonly options: OutboxPublisherOptions = {},
+    private readonly metrics?: FinancialMetrics,
   ) {
     this.batchSize = options.batchSize ?? 5;
 
@@ -232,6 +234,27 @@ export class OutboxPublisherWorker implements OnModuleInit, OnModuleDestroy {
 
     const message = this.rehydrate(record);
     message.scheduleRetry(new Date());
+
+    const affectedRows = await em.nativeUpdate(
+      OutboxMessageRecord,
+      {
+        id: job.id,
+        claimToken: job.claimToken,
+        publishedAt: null,
+      },
+      {
+        attempts: message.attempts,
+        nextAttemptAt: message.nextAttemptAt,
+        claimToken: null,
+        claimedUntil: null,
+      },
+    );
+
+    if (affectedRows === 1) {
+      this.metrics?.retries.inc({
+        component: 'outbox',
+      });
+    }
 
     await em.nativeUpdate(
       OutboxMessageRecord,
