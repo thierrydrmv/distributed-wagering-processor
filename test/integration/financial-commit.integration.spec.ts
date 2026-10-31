@@ -45,6 +45,7 @@ import { DeleteMessageCommand } from '@aws-sdk/client-sqs';
 import type { EventPublisher } from '../../src/application/ports/event-publisher';
 import { SqsEventPublisher } from '../../src/infrastructure/messaging/sqs-event.publisher';
 import { OutboxPublisherWorker } from '../../src/infrastructure/workers/outbox-publisher.worker';
+import { PersistenceConflictError } from '../../src/application/errors/wagering-error';
 
 async function captureFailure(action: () => Promise<unknown>): Promise<Error> {
   try {
@@ -73,7 +74,9 @@ describe('Financial consistency at real commit', () => {
   let applicationOrm: MikroORM;
 
   const wageringFixture = async () => {
-    const uow = new MikroOrmFinancialUnitOfWork(applicationOrm);
+    const metrics = new FinancialMetrics();
+
+    const uow = new MikroOrmFinancialUnitOfWork(applicationOrm, metrics);
     const playerId = randomUUID();
 
     const wallet = await new OpenWallet(uow).execute({
@@ -101,13 +104,17 @@ describe('Financial consistency at real commit', () => {
     };
 
     return {
-      processor: new ProcessWagerTransaction(uow),
+      processor: new ProcessWagerTransaction(uow, metrics),
       wallet,
       request,
+      metrics,
     };
   };
 
-  const consumerFixture = async (processor: ProcessWagerTransaction) => {
+  const consumerFixture = async (
+    processor: ProcessWagerTransaction,
+    metrics?: FinancialMetrics,
+  ) => {
     const endpoint = process.env.TEST_SQS_ENDPOINT;
 
     if (!endpoint) {
@@ -148,11 +155,15 @@ describe('Financial consistency at real commit', () => {
     const sourceUrl = source.QueueUrl;
     const dlqUrl = dlq.QueueUrl;
 
-    const consumer = new SqsWagerConsumer(processor, {
-      endpoint,
-      transactionsQueue,
-      dlqQueue,
-    });
+    const consumer = new SqsWagerConsumer(
+      processor,
+      {
+        endpoint,
+        transactionsQueue,
+        dlqQueue,
+      },
+      metrics,
+    );
 
     return {
       sqs,
@@ -958,7 +969,7 @@ describe('Financial consistency at real commit', () => {
   });
 
   test('replay returns the original balance after later movements', async () => {
-    const { processor, request } = await wageringFixture();
+    const { processor, request, metrics } = await wageringFixture();
     const bet = request();
 
     const original = await processor.execute(bet);
@@ -987,6 +998,46 @@ describe('Financial consistency at real commit', () => {
     expect(error).toMatchObject({
       code: 'IDEMPOTENCY_CONFLICT',
     });
+
+    const results = await metrics.transactionResults.get();
+
+    expect(results.values).toEqual([
+      {
+        labels: {
+          source: 'http',
+          status: 'PROCESSED',
+        },
+        value: 2,
+      },
+    ]);
+
+    const replays = await metrics.idempotentReplays.get();
+
+    expect(replays.values).toEqual([
+      {
+        labels: { source: 'http' },
+        value: 1,
+      },
+    ]);
+
+    const failures = await metrics.processingFailures.get();
+
+    expect(failures.values).toEqual([
+      {
+        labels: { source: 'http' },
+        value: 1,
+      },
+    ]);
+
+    const duration = await metrics.processingDuration.get();
+
+    const count = duration.values.find(
+      (value) =>
+        value.metricName === 'wagering_processing_duration_seconds_count' &&
+        value.labels.source === 'http',
+    );
+
+    expect(count?.value).toBe(4);
   });
 
   test('processes BET WIN LOSS REFUND and ROLLBACK', async () => {
@@ -1150,7 +1201,7 @@ describe('Financial consistency at real commit', () => {
   });
 
   test('reference worker persists backoff and rejects expired references', async () => {
-    const { processor, request } = await wageringFixture();
+    const { processor, request, metrics } = await wageringFixture();
 
     const pending = await processor.execute(
       request({
@@ -1159,7 +1210,7 @@ describe('Financial consistency at real commit', () => {
       }),
     );
 
-    const worker = new ReferenceRetryWorker(applicationOrm, processor);
+    const worker = new ReferenceRetryWorker(applicationOrm, processor, metrics);
 
     const due = await client.query<{ due_at_ms: string }>(
       `
@@ -1205,6 +1256,14 @@ describe('Financial consistency at real commit', () => {
       now.getTime() + 1_000,
     );
     expect(scheduled.rows[0]?.reference_claim_token).toBeNull();
+
+    const retries = await metrics.retries.get();
+
+    const referenceRetries = retries.values.find(
+      (value) => value.labels.component === 'reference',
+    );
+
+    expect(referenceRetries?.value ?? 0).toBeGreaterThanOrEqual(1);
 
     // Avança o relógio fornecido ao worker sem esperar quinze minutos.
     await worker.runOnce(new Date(now.getTime() + 16 * 60 * 1_000));
@@ -1516,8 +1575,9 @@ describe('Financial consistency at real commit', () => {
   });
 
   test('SQS consumer commits one debit for duplicate business messages', async () => {
-    const { processor, wallet, request } = await wageringFixture();
-    const fixture = await consumerFixture(processor);
+    const { processor, wallet, request, metrics } = await wageringFixture();
+
+    const fixture = await consumerFixture(processor, metrics);
 
     try {
       const input = request();
@@ -1545,6 +1605,35 @@ describe('Financial consistency at real commit', () => {
 
       expect(await fixture.consumer.runOnce(2)).toBe(1);
       expect(await fixture.consumer.runOnce(2)).toBe(1);
+
+      const results = await metrics.transactionResults.get();
+
+      expect(results.values).toEqual([
+        {
+          labels: {
+            source: 'sqs',
+            status: 'PROCESSED',
+          },
+          value: 1,
+        },
+      ]);
+
+      const replays = await metrics.idempotentReplays.get();
+
+      expect(replays.values).toEqual([
+        {
+          labels: { source: 'sqs' },
+          value: 1,
+        },
+      ]);
+
+      const failures = await metrics.processingFailures.get();
+
+      expect(failures.values).toHaveLength(0);
+
+      const retries = await metrics.retries.get();
+
+      expect(retries.values).toHaveLength(0);
 
       const stored = await client.query<{
         balance: string;
@@ -1595,8 +1684,9 @@ describe('Financial consistency at real commit', () => {
   }, 20_000);
 
   test('SQS consumer moves invalid envelopes to the DLQ', async () => {
-    const { processor } = await wageringFixture();
-    const fixture = await consumerFixture(processor);
+    const { processor, metrics } = await wageringFixture();
+
+    const fixture = await consumerFixture(processor, metrics);
 
     try {
       const body = JSON.stringify({ invalid: true });
@@ -1611,6 +1701,27 @@ describe('Financial consistency at real commit', () => {
       );
 
       expect(await fixture.consumer.runOnce(2)).toBe(1);
+
+      const dlqMetric = await metrics.dlqMessages.get();
+
+      expect(dlqMetric.values).toEqual([
+        {
+          labels: {},
+          value: 1,
+        },
+      ]);
+
+      const retries = await metrics.retries.get();
+
+      expect(retries.values).toHaveLength(0);
+
+      const results = await metrics.transactionResults.get();
+
+      expect(results.values).toHaveLength(0);
+
+      const processingFailures = await metrics.processingFailures.get();
+
+      expect(processingFailures.values).toHaveLength(0);
 
       const dlq = await fixture.sqs.send(
         new ReceiveMessageCommand({
@@ -1771,6 +1882,7 @@ describe('Financial consistency at real commit', () => {
   }, 30_000);
 
   test('outbox retains events and persists retry after transport failure', async () => {
+    const metrics = new FinancialMetrics();
     const uow = new MikroOrmFinancialUnitOfWork(applicationOrm);
 
     const wallet = await new OpenWallet(uow).execute({
@@ -1787,6 +1899,7 @@ describe('Financial consistency at real commit', () => {
       applicationOrm,
       unavailablePublisher,
       { aggregateId: wallet.id },
+      metrics,
     );
 
     try {
@@ -1812,6 +1925,15 @@ describe('Financial consistency at real commit', () => {
 
       expect(stored.rows).toHaveLength(2);
 
+      const retries = await metrics.retries.get();
+
+      expect(retries.values).toEqual([
+        {
+          labels: { component: 'outbox' },
+          value: 2,
+        },
+      ]);
+
       for (const row of stored.rows) {
         expect(row).toEqual({
           attempts: 1,
@@ -1823,5 +1945,71 @@ describe('Financial consistency at real commit', () => {
     } finally {
       await worker.onModuleDestroy();
     }
+  });
+
+  test('records a uniqueness conflict and preserves the existing wallet', async () => {
+    const metrics = new FinancialMetrics();
+
+    const uow = new MikroOrmFinancialUnitOfWork(applicationOrm, metrics);
+
+    const openWallet = new OpenWallet(uow);
+    const playerId = randomUUID();
+
+    const original = await openWallet.execute({
+      playerId,
+      initialBalance: {
+        amount: '0.00',
+        currency: 'BRL',
+      },
+    });
+
+    const before = await metrics.persistenceConflicts.get();
+
+    expect(before.values).toHaveLength(0);
+
+    const failure = await captureFailure(() =>
+      openWallet.execute({
+        playerId,
+        initialBalance: {
+          amount: '0.00',
+          currency: 'BRL',
+        },
+      }),
+    );
+
+    expect(failure).toBeInstanceOf(PersistenceConflictError);
+
+    const conflicts = await metrics.persistenceConflicts.get();
+
+    expect(conflicts.values).toEqual([
+      {
+        labels: {
+          reason: 'unique_constraint',
+        },
+        value: 1,
+      },
+    ]);
+
+    const stored = await client.query<{
+      id: string;
+      balance: string;
+      version: number;
+    }>(
+      `
+      select id, balance, version
+      from wallets
+      where player_id = $1::uuid
+        and currency = 'BRL'
+    `,
+      [playerId],
+    );
+
+    expect(stored.rows).toEqual([
+      {
+        id: original.id,
+        balance: '0.00',
+        version: 1,
+      },
+    ]);
   });
 });
